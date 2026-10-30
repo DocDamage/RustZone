@@ -1,0 +1,6 @@
+Windows Registry Editor Version 5.00
+
+; Remove Mastering Studio shell context menu associations
+[-HKEY_CURRENT_USER\Software\Classes\SystemFileAssociations\audio\shell\MasterWithMasteringStudio]
+[-HKEY_CURRENT_USER\Software\Classes\Directory\shell\BatchMasterWithMasteringStudio]
+

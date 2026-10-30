@@ -1,0 +1,30 @@
+[package]
+name = "mastering_studio"
+version = "1.0.0"
+edition = "2021"
+authors = ["Mastering Studio"]
+description = "Standalone audio mastering suite in Rust"
+
+[dependencies]
+cpal = "0.15"
+hound = "3.5"
+symphonia = { version = "0.5", default-features = false, features = ["wav", "mp3", "flac", "isomp4", "aac", "alac", "pcm"] }
+rfd = "0.15"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+ringbuf = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_HiDpi"
+] }

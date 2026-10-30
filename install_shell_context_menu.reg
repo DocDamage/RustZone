@@ -1,0 +1,25 @@
+Windows Registry Editor Version 5.00
+
+; Register "Master with Mastering Studio" for audio files in Windows Explorer
+[HKEY_CURRENT_USER\Software\Classes\SystemFileAssociations\audio\shell\MasterWithMasteringStudio]
+@="Master with Mastering Studio"
+"Icon"="\"D:\\dev\\ozone clone\\target\\release\\mastering_studio.exe\""
+
+[HKEY_CURRENT_USER\Software\Classes\SystemFileAssociations\audio\shell\MasterWithMasteringStudio\command]
+@="\"D:\\dev\\ozone clone\\target\\release\\mastering_studio.exe\" \"%1\""
+
+; File associations for common mastering formats
+[HKEY_CURRENT_USER\Software\Classes\.wav\OpenWithList\mastering_studio.exe]
+[HKEY_CURRENT_USER\Software\Classes\.mp3\OpenWithList\mastering_studio.exe]
+[HKEY_CURRENT_USER\Software\Classes\.flac\OpenWithList\mastering_studio.exe]
+[HKEY_CURRENT_USER\Software\Classes\.aif\OpenWithList\mastering_studio.exe]
+[HKEY_CURRENT_USER\Software\Classes\.aiff\OpenWithList\mastering_studio.exe]
+
+; Register "Batch Master with Mastering Studio" on audio folders
+[HKEY_CURRENT_USER\Software\Classes\Directory\shell\BatchMasterWithMasteringStudio]
+@="Batch Master with Mastering Studio"
+"Icon"="\"D:\\dev\\ozone clone\\target\\release\\mastering_studio.exe\""
+
+[HKEY_CURRENT_USER\Software\Classes\Directory\shell\BatchMasterWithMasteringStudio\command]
+@="\"D:\\dev\\ozone clone\\target\\release\\mastering_studio.exe\" \"%1\""
+

@@ -1,0 +1,3 @@
+/target
+# Third-party plugin binaries are not part of this project
+/Ozone 12/
