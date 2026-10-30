@@ -122,6 +122,14 @@ impl Module for MultibandDynamics {
         let gr: Vec<String> = self.bands.iter().map(|b| format!("{:.1}", b.gain_reduction_db.abs())).collect();
         Some(format!("Gain reduction (dB): {}", gr.join(" / ")))
     }
+    fn meters(&self) -> [f32; 4] {
+        [0, 1, 2, 3].map(|i| self.bands[i].gain_reduction_db)
+    }
+    fn set_meters(&mut self, m: [f32; 4]) {
+        for (b, v) in self.bands.iter_mut().zip(m) {
+            b.gain_reduction_db = v;
+        }
+    }
 }
 
 impl Module for MasteringImager {
@@ -238,5 +246,11 @@ impl Module for MasteringMaximizer {
     fn latency(&self) -> usize { self.latency_samples() }
     fn status(&self) -> Option<String> {
         Some(format!("Gain reduction: {:.1} dB", self.gain_reduction_db.abs()))
+    }
+    fn meters(&self) -> [f32; 4] {
+        [self.gain_reduction_db, 0.0, 0.0, 0.0]
+    }
+    fn set_meters(&mut self, m: [f32; 4]) {
+        self.gain_reduction_db = m[0];
     }
 }

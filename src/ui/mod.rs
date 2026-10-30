@@ -474,10 +474,12 @@ pub fn run_app() -> Result<(), String> {
         let _ = KillTimer(hwnd, TIMER_ID_REFRESH);
         if let Some(state) = GLOBAL_STATE.take() {
             state.engine.with_vst3_plugin(|p| {
-                if let Some(ref mut plugin) = p {
+                if let Some(plugin) = p {
                     plugin.destroy_view();
                 }
             });
+            let _ = state.engine.set_vst3_plugin(None);
+            state.engine.collect_garbage();
             let _ = DeleteObject(HGDIOBJ(state.bg_brush.0 as _));
             let _ = DeleteObject(HGDIOBJ(state.panel_brush.0 as _));
             let _ = DeleteObject(HGDIOBJ(state.accent_brush.0 as _));
@@ -578,7 +580,7 @@ unsafe fn set_info_text(hwnd: HWND, text: &str) {
 /// Run `f` with the render source matching the current processing mode. The VST3 plugin is
 /// detached from the engine for the duration, so the UI and audio thread never wait on the render.
 fn with_render_source<R>(engine: &AudioEngine, mode: ProcessingMode, f: impl for<'a> FnOnce(RenderSource<'a>) -> R) -> R {
-    let mut dsp_clone = engine.with_dsp_suite(|s| s.clone());
+    let mut dsp_clone = engine.dsp_suite_snapshot();
     engine.with_detached_vst3_plugin(|opt_plugin| {
         let source = match mode {
             ProcessingMode::Vst3 => match opt_plugin {
@@ -598,7 +600,7 @@ unsafe fn refresh_viewport_layout(state: &AppState) {
     let show_plugin = !state.in_stems_mode
         && !state.engine.in_montage_mode()
         && state.engine.processing_mode() != ProcessingMode::DspSuite;
-    let view_size = state.engine.with_vst3_plugin(|p| p.as_ref().map(|pl| pl.view_size));
+    let view_size = state.engine.with_vst3_plugin(|p| p.map(|pl| pl.view_size()));
     let plugin_view = GetWindow(state.child_viewport, GW_CHILD).ok().filter(|h| !h.is_invalid());
 
     match (plugin_view, view_size) {
@@ -689,13 +691,13 @@ unsafe fn load_module_by_index(index: usize) {
     state.selected_module_idx = index;
     let (ref name, ref path) = state.vst3_plugins[index];
 
-    // Detach and drop old plugin
+    // Detach the old plugin's editor and take it off the audio thread
     state.engine.with_vst3_plugin(|p| {
-        if let Some(ref mut old_plugin) = p {
+        if let Some(old_plugin) = p {
             old_plugin.destroy_view();
         }
-        *p = None;
     });
+    let _ = state.engine.set_vst3_plugin(None);
 
     // Built-in suite chosen
     if path.as_os_str().is_empty() {
@@ -709,7 +711,7 @@ unsafe fn load_module_by_index(index: usize) {
 
     println!("Loading fallback VST3 plugin: {} ({})", name, path.display());
     match Vst3Plugin::load(path) {
-        Ok(mut plugin) => {
+        Ok(plugin) => {
             match plugin.create_view(state.child_viewport) {
                 Ok(view_rect) => {
                     println!("Attached plugin editor: {}x{}", view_rect.width(), view_rect.height());
@@ -1479,12 +1481,40 @@ unsafe extern "system" fn viewport_wnd_proc(
     }
 }
 
+/// Separate the loaded track with the trained model on a worker thread, reporting progress
+fn spawn_ml_separation(state: &AppState, panel_hwnd: HWND) {
+    let engine = Arc::clone(&state.engine);
+    let info_raw = state.info_label_hwnd.0 as usize;
+    let panel_raw = panel_hwnd.0 as usize;
+    std::thread::spawn(move || unsafe {
+        let info = HWND(info_raw as *mut _);
+        let last_pct = std::sync::atomic::AtomicI32::new(-1);
+        let result = engine.separate_with_model(|p| {
+            let pct = (p * 100.0) as i32;
+            if last_pct.swap(pct, Ordering::Relaxed) != pct {
+                set_info_text(info, &format!("Separating stems with the trained model: {}%", pct));
+            }
+        });
+        match result {
+            Ok(_) => set_info_text(info, "Stems ready: Stem Rebalance and Stem EQ now use the separated stems"),
+            Err(e) => set_info_text(info, &format!("Stem separation: {}", e)),
+        }
+        let _ = InvalidateRect(HWND(panel_raw as *mut _), None, false);
+    });
+}
+
 /// Route a click or wheel gesture on the built-in suite editor. Returns true if it hit the panel.
 unsafe fn dsp_panel_gesture(state: &AppState, hwnd: HWND, x: i32, y: i32, steps: i32, fine: bool, is_wheel: bool) -> bool {
     let mut selected = state.dsp_selected.get();
     let Some(hit) = state.engine.with_dsp_suite(|s| dsp_panel::hit_test(s, selected, x, y)) else {
         return false;
     };
+    if hit == dsp_panel::PanelHit::SeparateStems {
+        if !is_wheel && steps > 0 {
+            spawn_ml_separation(state, hwnd);
+        }
+        return true;
+    }
     if hit == dsp_panel::PanelHit::LearnMatch {
         if !is_wheel && steps > 0 {
             match state.engine.learn_match_eq() {
@@ -1495,11 +1525,13 @@ unsafe fn dsp_panel_gesture(state: &AppState, hwnd: HWND, x: i32, y: i32, steps:
         }
         return true;
     }
-    let changed = state.engine.with_dsp_suite(|s| dsp_panel::apply(s, &mut selected, hit, steps, fine, is_wheel));
-    state.dsp_selected.set(selected);
-    if changed {
-        let _ = InvalidateRect(hwnd, None, false);
+    if dsp_panel::edits_suite(hit, steps, is_wheel) {
+        let current = selected;
+        state.engine.edit_dsp_suite(move |s| dsp_panel::apply_edit(s, current, hit, steps, fine, is_wheel));
     }
+    selected = dsp_panel::selection_after(hit, selected, is_wheel);
+    state.dsp_selected.set(selected);
+    let _ = InvalidateRect(hwnd, None, false);
     true
 }
 
@@ -2014,6 +2046,18 @@ unsafe extern "system" fn wnd_proc(
                         set_info_text(state.info_label_hwnd, &format!("Export format: {}", EXPORT_FORMATS[state.export_format_idx].name));
                         let _ = InvalidateRect(state.child_viewport, None, false);
                     }
+                    0x47 => { // 'G': Loudness-matched A/B (processed plays at the input's loudness)
+                        let on = !state.engine.ab_gain_match();
+                        state.engine.set_ab_gain_match(on);
+                        set_info_text(
+                            state.info_label_hwnd,
+                            if on {
+                                "Loudness-matched A/B ON: processed audio plays at the input's loudness"
+                            } else {
+                                "Loudness-matched A/B OFF"
+                            },
+                        );
+                    }
                     0x48 => { // 'H': Open WASAPI Audio Hardware Settings & Diagnostics
                         let _ = PostMessageW(hwnd, WM_COMMAND, WPARAM(ID_BTN_DEVICE_SETTINGS), LPARAM(0));
                     }
@@ -2130,7 +2174,7 @@ unsafe extern "system" fn wnd_proc(
             if let Some(ref mut state) = GLOBAL_STATE {
                 match cc_num {
                     1 => { // CC 1 (Mod Wheel): Exciter Drive / Mix
-                        state.engine.with_dsp_suite(|s| {
+                        state.engine.edit_dsp_suite(move |s| {
                             s.exciter.drive = norm;
                             s.exciter.mix = norm.clamp(0.0, 1.0);
                         });
@@ -2141,7 +2185,7 @@ unsafe extern "system" fn wnd_proc(
                     }
                     7 => { // CC 7 (Volume Fader): Maximizer Threshold (-24.0 dB to 0.0 dB)
                         let thresh = -24.0 * (1.0 - norm);
-                        state.engine.with_dsp_suite(|s| {
+                        state.engine.edit_dsp_suite(move |s| {
                             s.maximizer.threshold_db = thresh;
                         });
                         let msg = format!("MIDI CC 7 (Volume): Maximizer Threshold = {:.1} dB", thresh);
@@ -2151,7 +2195,7 @@ unsafe extern "system" fn wnd_proc(
                     }
                     10 => { // CC 10 (Pan / Width): Stereo Width (0.0 to 2.0)
                         let width = norm * 2.0;
-                        state.engine.with_dsp_suite(|s| {
+                        state.engine.edit_dsp_suite(move |s| {
                             s.imager.width = width;
                         });
                         let msg = format!("MIDI CC 10 (Pan): Stereo Width = {:.0}%", width * 100.0);
@@ -2495,7 +2539,7 @@ unsafe extern "system" fn wnd_proc(
                             return LRESULT(0);
                         }
 
-                        let opt_buf = state.engine.with_audio_buffer(|b| b.clone());
+                        let opt_buf = state.engine.audio_buffer();
                         let buf = match opt_buf {
                             Some(b) => b,
                             None => {
@@ -2525,12 +2569,14 @@ unsafe extern "system" fn wnd_proc(
                             std::thread::spawn(move || {
                                 let info_hwnd = HWND(info_hwnd_raw as *mut _);
                                 let trim_fade = engine.trim_fade();
+                                let stems = engine.ml_stems();
 
                                 let render_res = with_render_source(&engine, current_mode, |source| {
                                     let render_opts = RenderOptions {
                                         trim_fade: Some(trim_fade),
                                         bwf_metadata: Some(BwfMetadata::default()),
                                         target_sample_rate: format.sample_rate,
+                                        stems: stems.clone(),
                                         ..Default::default()
                                     };
 
@@ -2657,7 +2703,7 @@ unsafe extern "system" fn wnd_proc(
                             } else if let Ok(bytes) = std::fs::read(&load_path) {
                                 let mut loaded = false;
                                 state.engine.with_vst3_plugin(|opt_plugin| {
-                                    if let Some(ref mut plugin) = opt_plugin {
+                                    if let Some(plugin) = opt_plugin {
                                         if plugin.load_state(&bytes).is_ok() {
                                             loaded = true;
                                         }
@@ -2744,6 +2790,7 @@ unsafe extern "system" fn wnd_proc(
         WM_TIMER => {
             if wparam.0 == TIMER_ID_REFRESH {
                 if let Some(ref state) = GLOBAL_STATE {
+                    state.engine.collect_garbage();
                     let cur_sec = state.engine.current_position_seconds();
                     let total_sec = state.engine.duration_seconds();
 
@@ -2770,13 +2817,16 @@ unsafe extern "system" fn wnd_proc(
 
                     // Update Loudness, True Peak, and Phase Correlation mastering meter text
                     let meters = state.engine.get_meter_levels();
-                    let meter_str = format!(
+                    let mut meter_str = format!(
                         "I:{:4.1} S:{:4.1} LUFS | TP:{:4.1} | Ø:{:+4.2}",
                         meters.integrated_lufs,
                         meters.short_term_lufs,
                         meters.true_peak_l_dbtp.max(meters.true_peak_r_dbtp),
                         meters.phase_correlation,
                     );
+                    if state.engine.ab_gain_match() {
+                        meter_str.push_str(&format!(" | Match {:+.1} dB", meters.ab_match_db));
+                    }
                     let wide_meter: Vec<u16> = meter_str.encode_utf16().chain(Some(0)).collect();
                     let _ = SetWindowTextW(state.meter_label_hwnd, PCWSTR(wide_meter.as_ptr()));
 

@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use super::buffer::AudioBuffer;
 use super::bwf::BwfMetadata;
+use super::ml_separator::{StemBus, StemSet};
 use super::resample::SincResampler;
 use super::trim::TrimFadeSettings;
 use crate::dsp::{DitherType, MasteringDither, MasteringSuite};
@@ -41,10 +42,13 @@ pub struct RenderOptions {
     pub target_sample_rate: Option<u32>,
     /// Overrides the bit depth's default dither (`ExportBitDepth::default_dither`)
     pub dither: Option<DitherType>,
+    /// Separated stems of `input_buffer`. With the built-in suite, Stem Rebalance / Stem EQ are
+    /// then applied to the real stems instead of the real-time approximation.
+    pub stems: Option<Arc<StemSet>>,
 }
 
 pub enum RenderSource<'a> {
-    Vst3(&'a mut Vst3Plugin),
+    Vst3(&'a Vst3Plugin),
     Dsp(&'a mut MasteringSuite),
     Bypass,
 }
@@ -53,7 +57,7 @@ impl RenderSource<'_> {
     /// Processing delay introduced by the source, removed from the rendered output
     fn latency_samples(&self) -> usize {
         match self {
-            RenderSource::Vst3(plugin) => plugin.latency as usize,
+            RenderSource::Vst3(plugin) => plugin.latency() as usize,
             RenderSource::Dsp(suite) => suite.latency_samples(),
             RenderSource::Bypass => 0,
         }
@@ -147,7 +151,7 @@ pub fn render_to_wav<P: AsRef<Path>>(
 
     // Save previous configuration to restore after offline bounce
     let vst3_restore_params = match &source {
-        RenderSource::Vst3(plugin) => Some((plugin.sample_rate, plugin.max_block_size)),
+        RenderSource::Vst3(plugin) => Some((plugin.sample_rate(), plugin.max_block_size())),
         _ => None,
     };
 
@@ -161,6 +165,25 @@ pub fn render_to_wav<P: AsRef<Path>>(
             suite.set_sample_rate(sample_rate as f32);
             suite.reset_state();
         }
+        RenderSource::Bypass => {}
+    }
+
+    // Trained stems drive the input when they belong to this buffer and a stem module is on
+    let mut stem_feed: Option<(Arc<StemSet>, StemBus)> = None;
+    match &mut source {
+        RenderSource::Dsp(suite) => {
+            let stems = options
+                .as_ref()
+                .and_then(|o| o.stems.clone())
+                .filter(|s| s.num_frames == num_frames && s.sample_rate == sample_rate);
+            suite.external_stems = stems.is_some() && suite.uses_stems();
+            if suite.external_stems {
+                let mut bus = StemBus::new(sample_rate as f32);
+                bus.configure(suite);
+                stem_feed = stems.map(|s| (s, bus));
+            }
+        }
+        RenderSource::Vst3(_) => {}
         RenderSource::Bypass => {}
     }
 
@@ -200,10 +223,12 @@ pub fn render_to_wav<P: AsRef<Path>>(
 
         let chunk = (feed_end - frame_cursor).min(block_size);
         for i in 0..chunk {
-            let (l, r) = if frame_cursor + i < end_frame {
-                input_buffer.get_stereo_frame(frame_cursor + i)
-            } else {
+            let (l, r) = if frame_cursor + i >= end_frame {
                 (0.0, 0.0)
+            } else if let Some((stems, bus)) = stem_feed.as_mut() {
+                bus.mix(stems.frames_at_index(frame_cursor + i))
+            } else {
+                input_buffer.get_stereo_frame(frame_cursor + i)
             };
             in_block_l[i] = l;
             in_block_r[i] = r;

@@ -20,6 +20,66 @@ impl BiquadCoeffs {
     }
 }
 
+/// Running K-weighted loudness over an exponential window, used for gain matching (A/B and
+/// per-module auto gain) rather than for standards-compliant metering
+#[derive(Clone, Debug)]
+pub struct LoudnessFollower {
+    filter: KWeightingFilter,
+    mean_square: f64,
+    window_s: f32,
+    sample_rate: f32,
+    primed: bool,
+}
+
+impl LoudnessFollower {
+    pub fn new(sample_rate: f32, window_s: f32) -> Self {
+        Self { filter: KWeightingFilter::new(sample_rate), mean_square: 0.0, window_s, sample_rate, primed: false }
+    }
+
+    pub fn set_sample_rate(&mut self, sample_rate: f32) {
+        self.sample_rate = sample_rate;
+        self.filter.set_sample_rate(sample_rate);
+        self.reset();
+    }
+
+    pub fn reset(&mut self) {
+        self.filter.reset();
+        self.mean_square = 0.0;
+        self.primed = false;
+    }
+
+    pub fn feed(&mut self, left: &[f32], right: &[f32]) {
+        let n = left.len().min(right.len());
+        if n == 0 {
+            return;
+        }
+        let mut sum = 0.0f64;
+        for i in 0..n {
+            let (kl, kr) = self.filter.process_sample(left[i], right[i]);
+            sum += (kl * kl + kr * kr) as f64;
+        }
+        let block_ms = sum / n as f64;
+        if !self.primed {
+            if block_ms > 1e-9 {
+                self.mean_square = block_ms;
+                self.primed = true;
+            }
+            return;
+        }
+        let c = (-(n as f64) / (self.window_s as f64 * self.sample_rate as f64)).exp();
+        self.mean_square = self.mean_square * c + block_ms * (1.0 - c);
+    }
+
+    /// True once there is signal above roughly -70 LUFS
+    pub fn is_active(&self) -> bool {
+        self.primed && self.mean_square > 1e-7
+    }
+
+    pub fn lufs(&self) -> f32 {
+        (-0.691 + 10.0 * self.mean_square.max(1e-12).log10()) as f32
+    }
+}
+
 /// Dual-stage K-Weighting Filter (Stage 1: High Shelf, Stage 2: RLB High-Pass)
 #[derive(Clone, Debug)]
 pub struct KWeightingFilter {

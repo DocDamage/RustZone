@@ -16,6 +16,7 @@ pub mod vintage;
 mod core_modules;
 
 pub use lufs::*;
+pub use k_weighting::LoudnessFollower;
 pub use fft::*;
 pub use dynamic_eq::*;
 pub use multiband::*;
@@ -384,6 +385,63 @@ pub const DEFAULT_CHAIN: &[ModuleKind] = &[
     ModuleKind::Maximizer,
 ];
 
+/// Per-module loudness compensation: measures loudness before and after a module and
+/// trims its output so switching or tweaking the module changes tone, not level
+#[derive(Clone, Debug)]
+pub struct AutoGain {
+    pre: LoudnessFollower,
+    post: LoudnessFollower,
+    gain: f32,
+}
+
+impl AutoGain {
+    const MAX_DB: f32 = 12.0;
+
+    fn new(sample_rate: f32) -> Self {
+        Self { pre: LoudnessFollower::new(sample_rate, 3.0), post: LoudnessFollower::new(sample_rate, 3.0), gain: 1.0 }
+    }
+
+    fn set_sample_rate(&mut self, sr: f32) {
+        self.pre.set_sample_rate(sr);
+        self.post.set_sample_rate(sr);
+        self.gain = 1.0;
+    }
+
+    fn reset(&mut self) {
+        self.pre.reset();
+        self.post.reset();
+        self.gain = 1.0;
+    }
+
+    /// Current compensation in dB
+    pub fn gain_db(&self) -> f32 {
+        20.0 * self.gain.max(1e-6).log10()
+    }
+
+    /// Ramp the output toward the measured compensation over ~300 ms
+    fn apply(&mut self, left: &mut [f32], right: &mut [f32], sample_rate: f32) {
+        let n = left.len().min(right.len());
+        if n == 0 {
+            return;
+        }
+        let target = if self.pre.is_active() && self.post.is_active() {
+            let db = (self.pre.lufs() - self.post.lufs()).clamp(-Self::MAX_DB, Self::MAX_DB);
+            10.0f32.powf(db / 20.0)
+        } else {
+            self.gain
+        };
+        let c = (-(n as f32) / (0.3 * sample_rate.max(1.0))).exp();
+        let next = target + c * (self.gain - target);
+        let step = (next - self.gain) / n as f32;
+        for i in 0..n {
+            let g = self.gain + step * (i + 1) as f32;
+            left[i] *= g;
+            right[i] *= g;
+        }
+        self.gain = next;
+    }
+}
+
 /// The complete built-in mastering suite: an ordered chain of modules plus metering
 #[derive(Clone, Debug)]
 pub struct MasteringSuite {
@@ -408,6 +466,12 @@ pub struct MasteringSuite {
     pub maximizer: MasteringMaximizer,
     /// Processing order
     pub chain: Vec<ModuleKind>,
+    /// Per-module auto gain-match switches, indexed by `ModuleKind::index`
+    pub auto_gain: [bool; ModuleKind::COUNT],
+    /// Set by the host while separated stems are being mixed in front of the chain (applying
+    /// Stem Rebalance / Stem EQ to the real stems), so the real-time approximations step aside
+    pub external_stems: bool,
+    auto_gain_state: Vec<AutoGain>,
     pub lufs_meter: EbuR128Meter,
     pub spectral_analyzer: SpectralAnalyzer,
     pub sample_rate: f32,
@@ -436,6 +500,9 @@ impl MasteringSuite {
             opto_limiter: OptoLimiter::new(sample_rate),
             maximizer: MasteringMaximizer::new(sample_rate),
             chain: DEFAULT_CHAIN.to_vec(),
+            auto_gain: [false; ModuleKind::COUNT],
+            external_stems: false,
+            auto_gain_state: vec![AutoGain::new(sample_rate); ModuleKind::COUNT],
             lufs_meter: EbuR128Meter::new(sample_rate),
             spectral_analyzer: SpectralAnalyzer::new(sample_rate),
             sample_rate,
@@ -490,6 +557,25 @@ impl MasteringSuite {
         }
     }
 
+    /// Switch a module's auto gain-match on or off (restarting its measurement)
+    pub fn set_auto_gain(&mut self, kind: ModuleKind, on: bool) {
+        let idx = kind.index();
+        if self.auto_gain[idx] != on {
+            self.auto_gain[idx] = on;
+            self.auto_gain_state[idx].reset();
+        }
+    }
+
+    /// Current auto gain-match compensation of a module in dB
+    pub fn auto_gain_db(&self, kind: ModuleKind) -> f32 {
+        self.auto_gain_state[kind.index()].gain_db()
+    }
+
+    /// Mirror a compensation value measured elsewhere (the UI copy shows the audio thread's)
+    pub fn show_auto_gain_db(&mut self, kind: ModuleKind, db: f32) {
+        self.auto_gain_state[kind.index()].gain = 10.0f32.powf(db / 20.0);
+    }
+
     /// Move a module `delta` slots in the chain (negative = earlier)
     pub fn move_module(&mut self, kind: ModuleKind, delta: i32) {
         if let Some(pos) = self.chain.iter().position(|k| *k == kind) {
@@ -513,6 +599,9 @@ impl MasteringSuite {
         for &kind in ModuleKind::ALL {
             self.module_mut(kind).set_sample_rate(sample_rate);
         }
+        for ag in self.auto_gain_state.iter_mut() {
+            ag.set_sample_rate(sample_rate);
+        }
         self.lufs_meter.set_sample_rate(sample_rate);
         self.spectral_analyzer.set_sample_rate(sample_rate);
     }
@@ -520,6 +609,9 @@ impl MasteringSuite {
     pub fn reset_state(&mut self) {
         for &kind in ModuleKind::ALL {
             self.module_mut(kind).reset();
+        }
+        for ag in self.auto_gain_state.iter_mut() {
+            ag.reset();
         }
         self.lufs_meter.reset();
         self.spectral_analyzer.reset();
@@ -529,19 +621,40 @@ impl MasteringSuite {
     pub fn latency_samples(&self) -> usize {
         self.chain
             .iter()
+            .filter(|&&k| !(self.external_stems && Self::is_stem_module(k)))
             .map(|&k| self.module(k))
             .filter(|m| m.enabled())
             .map(|m| m.latency())
             .sum()
     }
 
+    fn is_stem_module(kind: ModuleKind) -> bool {
+        matches!(kind, ModuleKind::StemRebalance | ModuleKind::StemEq)
+    }
+
+    /// Whether Stem Rebalance or Stem EQ is switched on
+    pub fn uses_stems(&self) -> bool {
+        self.stem_rebalance.enabled || self.stem_eq.enabled
+    }
+
     /// Process audio through the mastering chain. Dither is applied at export time by the renderer.
     pub fn process_stereo(&mut self, left: &mut [f32], right: &mut [f32]) {
+        let sr = self.sample_rate;
         for i in 0..self.chain.len() {
             let kind = self.chain[i];
-            let module = self.module_mut(kind);
-            if module.enabled() {
-                module.process(left, right);
+            if !self.module(kind).enabled() || (self.external_stems && Self::is_stem_module(kind)) {
+                continue;
+            }
+            let idx = kind.index();
+            let auto = self.auto_gain[idx];
+            if auto {
+                self.auto_gain_state[idx].pre.feed(left, right);
+            }
+            self.module_mut(kind).process(left, right);
+            if auto {
+                let ag = &mut self.auto_gain_state[idx];
+                ag.post.feed(left, right);
+                ag.apply(left, right, sr);
             }
         }
 

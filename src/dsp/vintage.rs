@@ -146,7 +146,12 @@ impl Module for VintageCompressor {
         self.gain_reduction_db = max_gr.max(self.gain_reduction_db * 0.9);
     }
     fn status(&self) -> Option<String> {
-        Some(format!("Gain reduction: {:.1} dB", self.gain_reduction_db))
+        Some(format!("Gain reduction: {:.1} dB", self.gain_reduction_db))    }
+    fn meters(&self) -> [f32; 4] {
+        [self.gain_reduction_db, 0.0, 0.0, 0.0]
+    }
+    fn set_meters(&mut self, m: [f32; 4]) {
+        self.gain_reduction_db = m[0];
     }
 }
 
@@ -374,7 +379,12 @@ impl Module for OptoLimiter {
         self.gain_reduction_db = max_gr.max(self.gain_reduction_db * 0.9);
     }
     fn status(&self) -> Option<String> {
-        Some(format!("Gain reduction: {:.1} dB", self.gain_reduction_db))
+        Some(format!("Gain reduction: {:.1} dB", self.gain_reduction_db))    }
+    fn meters(&self) -> [f32; 4] {
+        [self.gain_reduction_db, 0.0, 0.0, 0.0]
+    }
+    fn set_meters(&mut self, m: [f32; 4]) {
+        self.gain_reduction_db = m[0];
     }
 }
 

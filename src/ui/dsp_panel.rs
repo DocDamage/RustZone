@@ -28,6 +28,7 @@ const PARAM_COL_GAP: i32 = 4;
 const PARAM_ROWS_PER_COL: usize = 24;
 
 const LEARN_BUTTON: RECT = RECT { left: 940, top: 72, right: 1220, bottom: 96 };
+const AUTO_GAIN_BUTTON: RECT = RECT { left: 700, top: 72, right: 930, bottom: 96 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PanelHit {
@@ -35,10 +36,16 @@ pub enum PanelHit {
     ChainSelect(ModuleKind),
     Param(usize),
     LearnMatch,
+    AutoGain,
+    SeparateStems,
 }
 
 fn inside(r: &RECT, x: i32, y: i32) -> bool {
     x >= r.left && x < r.right && y >= r.top && y < r.bottom
+}
+
+fn is_stem_module(kind: ModuleKind) -> bool {
+    matches!(kind, ModuleKind::StemRebalance | ModuleKind::StemEq)
 }
 
 pub fn hit_test(suite: &MasteringSuite, selected: ModuleKind, x: i32, y: i32) -> Option<PanelHit> {
@@ -49,6 +56,12 @@ pub fn hit_test(suite: &MasteringSuite, selected: ModuleKind, x: i32, y: i32) ->
     }
     if selected == ModuleKind::MatchEq && inside(&LEARN_BUTTON, x, y) {
         return Some(PanelHit::LearnMatch);
+    }
+    if is_stem_module(selected) && inside(&LEARN_BUTTON, x, y) {
+        return Some(PanelHit::SeparateStems);
+    }
+    if inside(&AUTO_GAIN_BUTTON, x, y) {
+        return Some(PanelHit::AutoGain);
     }
     if x >= PARAMS_LEFT && y >= PARAMS_TOP {
         let col = ((x - PARAMS_LEFT) / (PARAM_COL_W + PARAM_COL_GAP)) as usize;
@@ -67,39 +80,50 @@ pub fn hit_test(suite: &MasteringSuite, selected: ModuleKind, x: i32, y: i32) ->
     None
 }
 
-/// Apply a click or wheel gesture. Returns true when something changed.
-pub fn apply(suite: &mut MasteringSuite, selected: &mut ModuleKind, hit: PanelHit, steps: i32, fine: bool, is_wheel: bool) -> bool {
+/// Whether a gesture changes the suite (as opposed to only the selection)
+pub fn edits_suite(hit: PanelHit, steps: i32, is_wheel: bool) -> bool {
     match hit {
-        PanelHit::ChainToggle(kind) if is_wheel => {
-            suite.move_module(kind, -steps);
-            true
-        }
-        PanelHit::ChainSelect(kind) if is_wheel => {
-            suite.move_module(kind, -steps);
-            true
-        }
+        PanelHit::ChainToggle(_) => is_wheel || steps > 0,
+        PanelHit::ChainSelect(_) => is_wheel,
+        PanelHit::Param(_) | PanelHit::AutoGain => true,
+        PanelHit::LearnMatch | PanelHit::SeparateStems => false,
+    }
+}
+
+/// Module selected after a gesture
+pub fn selection_after(hit: PanelHit, current: ModuleKind, is_wheel: bool) -> ModuleKind {
+    match hit {
+        PanelHit::ChainToggle(kind) | PanelHit::ChainSelect(kind) if !is_wheel => kind,
+        _ => current,
+    }
+}
+
+/// Apply a gesture's change to a suite. Runs on both the UI copy and the audio thread's copy,
+/// so it must only depend on its arguments.
+pub fn apply_edit(suite: &mut MasteringSuite, selected: ModuleKind, hit: PanelHit, steps: i32, fine: bool, is_wheel: bool) {
+    match hit {
+        PanelHit::ChainToggle(kind) | PanelHit::ChainSelect(kind) if is_wheel => suite.move_module(kind, -steps),
         PanelHit::ChainToggle(kind) => {
             if steps > 0 {
                 let m = suite.module_mut(kind);
                 let on = m.enabled();
                 m.set_enabled(!on);
             }
-            *selected = kind;
-            true
         }
-        PanelHit::ChainSelect(kind) => {
-            *selected = kind;
-            true
-        }
+        PanelHit::ChainSelect(_) => {}
         PanelHit::Param(i) => {
-            let infos = suite.module(*selected).params();
-            let Some(info) = infos.get(i) else { return false };
-            let m = suite.module_mut(*selected);
-            let v = m.get_param(i);
-            m.set_param(i, info.stepped(v, steps, fine));
-            true
+            let infos = suite.module(selected).params();
+            if let Some(info) = infos.get(i) {
+                let m = suite.module_mut(selected);
+                let v = m.get_param(i);
+                m.set_param(i, info.stepped(v, steps, fine));
+            }
         }
-        PanelHit::LearnMatch => false, // handled by the window, which owns the audio buffers
+        PanelHit::AutoGain => {
+            let on = suite.auto_gain[selected.index()];
+            suite.set_auto_gain(selected, !on);
+        }
+        PanelHit::LearnMatch | PanelHit::SeparateStems => {} // handled by the window
     }
 }
 
@@ -112,6 +136,8 @@ struct PanelData {
     chain: Vec<(ModuleKind, bool)>,
     rows: Vec<ParamRow>,
     selected_on: bool,
+    auto_gain: bool,
+    auto_gain_db: f32,
     status: Option<String>,
     latency: usize,
     sample_rate: f32,
@@ -129,6 +155,8 @@ fn gather(suite: &MasteringSuite, selected: ModuleKind) -> PanelData {
         chain: suite.chain.iter().map(|&k| (k, suite.module(k).enabled())).collect(),
         rows,
         selected_on: m.enabled(),
+        auto_gain: suite.auto_gain[selected.index()],
+        auto_gain_db: suite.auto_gain_db(selected),
         status: m.status(),
         latency: suite.latency_samples(),
         sample_rate: suite.sample_rate,
@@ -200,7 +228,7 @@ pub unsafe fn paint(hdc: HDC, state: &AppState) {
     // Selected module header
     let _ = SelectObject(hdc, HGDIOBJ(state.hfont_bold.0 as _));
     let _ = SetTextColor(hdc, if data.selected_on { COLORREF(0x00E5FF) } else { COLORREF(0x888888) });
-    let mut head_rect = RECT { left: PARAMS_LEFT, top: 72, right: 930, bottom: 96 };
+    let mut head_rect = RECT { left: PARAMS_LEFT, top: 72, right: AUTO_GAIN_BUTTON.left - 8, bottom: 96 };
     let head = format!("{}{}", selected.name(), if data.selected_on { "" } else { "  (off: click its box to enable)" });
     draw_text_str(hdc, &head, &mut head_rect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
     if let Some(ref status) = data.status {
@@ -208,6 +236,43 @@ pub unsafe fn paint(hdc: HDC, state: &AppState) {
         let _ = SetTextColor(hdc, COLORREF(0x00FF88));
         let mut st = RECT { left: PARAMS_LEFT, top: 96, right: 1220, bottom: 116 };
         draw_text_str(hdc, status, &mut st, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    }
+    {
+        let hovered = state.dsp_hover.get() == Some(PanelHit::AutoGain);
+        let _ = FillRect(hdc, &AUTO_GAIN_BUTTON, if data.auto_gain { state.meter_green_brush } else if hovered { state.corr_dim_brush } else { state.panel_brush });
+        let _ = FrameRect(hdc, &AUTO_GAIN_BUTTON, state.meter_dim_brush);
+        let _ = SelectObject(hdc, HGDIOBJ(state.hfont_bold.0 as _));
+        let _ = SetTextColor(hdc, if data.auto_gain { COLORREF(0x101010) } else { COLORREF(0xAAAAAA) });
+        let label = if data.auto_gain {
+            format!("Auto gain-match: ON ({:+.1} dB)", data.auto_gain_db)
+        } else {
+            "Auto gain-match: OFF".to_string()
+        };
+        let mut br = AUTO_GAIN_BUTTON;
+        draw_text_str(hdc, &label, &mut br, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    }
+    if is_stem_module(selected) {
+        use crate::audio::engine::StemStatus;
+        let status = state.engine.stem_status();
+        let (button, line) = match status {
+            StemStatus::Unavailable => (None, "Real-time approximation (no trained model found in models/)".to_string()),
+            StemStatus::NotSeparated => (Some("Separate stems (AI)"), "Real-time approximation: separate the track for full quality".to_string()),
+            StemStatus::Separating(p) => (None, format!("Separating stems with the trained model: {:.0}%", p * 100.0)),
+            StemStatus::Ready => (Some("Re-separate stems (AI)"), "Using AI-separated stems (playback and export)".to_string()),
+        };
+        if let Some(label) = button {
+            let hovered = state.dsp_hover.get() == Some(PanelHit::SeparateStems);
+            let _ = FillRect(hdc, &LEARN_BUTTON, if hovered { state.corr_dim_brush } else { state.panel_brush });
+            let _ = FrameRect(hdc, &LEARN_BUTTON, state.accent_brush);
+            let _ = SelectObject(hdc, HGDIOBJ(state.hfont_bold.0 as _));
+            let _ = SetTextColor(hdc, COLORREF(0x00E5FF));
+            let mut br = LEARN_BUTTON;
+            draw_text_str(hdc, label, &mut br, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        }
+        let _ = SelectObject(hdc, HGDIOBJ(state.hfont_ui.0 as _));
+        let _ = SetTextColor(hdc, if status == StemStatus::Ready { COLORREF(0x00FF88) } else { COLORREF(0x00D7FF) });
+        let mut st = RECT { left: PARAMS_LEFT, top: 96, right: 1220, bottom: 116 };
+        draw_text_str(hdc, &line, &mut st, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
     }
     if selected == ModuleKind::MatchEq {
         let hovered = state.dsp_hover.get() == Some(PanelHit::LearnMatch);

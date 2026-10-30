@@ -2,6 +2,8 @@ use std::ffi::{c_void, CStr, CString};
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use parking_lot::Mutex;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{BOOL, HMODULE, HWND};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW, SetDllDirectoryW};
@@ -14,26 +16,34 @@ extern "system" {
 use super::host::*;
 use super::types::*;
 
+/// A hosted VST3 plugin, shared between the UI thread and the audio thread.
+///
+/// Follows the VST3 threading model: `process_stereo` runs on the audio thread while the editor,
+/// wheel and state calls run on the UI thread. `setup_audio` must only be called while nothing
+/// is processing (the engine detaches the plugin from the audio thread first). Mutable host-side
+/// fields are atomics so every method takes `&self`.
 pub struct Vst3Plugin {
     hmodule: HMODULE,
     factory: *mut c_void,
     component: *mut c_void,
     processor: *mut c_void,
     controller: *mut c_void,
-    view: *mut c_void,
+    view: AtomicPtr<c_void>,
     host_app: *mut HostAppCom,
     comp_handler: *mut HostComponentHandlerCom,
-    plug_frame: *mut HostPlugFrameCom,
+    plug_frame: AtomicPtr<HostPlugFrameCom>,
     pub name: String,
-    pub sample_rate: f64,
-    pub max_block_size: usize,
-    pub latency: u32,
-    pub view_size: ViewRect,
-    pub sample_pos: i64,
-    is_active: bool,
+    sample_rate_bits: AtomicU64,
+    max_block_size: AtomicUsize,
+    latency: AtomicU32,
+    view_size: Mutex<ViewRect>,
+    sample_pos: AtomicI64,
+    is_active: AtomicBool,
 }
 
 unsafe impl Send for Vst3Plugin {}
+// The COM pointers are only used per the VST3 threading rules described above
+unsafe impl Sync for Vst3Plugin {}
 
 impl Vst3Plugin {
     pub fn load(vst3_path: &Path) -> Result<Self, String> {
@@ -212,23 +222,23 @@ impl Vst3Plugin {
             return Err(format!("Failed to query IAudioProcessor: 0x{:08X}", r));
         }
 
-        let mut plugin = Self {
+        let plugin = Self {
             hmodule,
             factory,
             component,
             processor,
             controller,
-            view: ptr::null_mut(),
+            view: AtomicPtr::new(ptr::null_mut()),
             host_app,
             comp_handler,
-            plug_frame: ptr::null_mut(),
+            plug_frame: AtomicPtr::new(ptr::null_mut()),
             name: plugin_name,
-            sample_rate: 48000.0,
-            max_block_size: 512,
-            latency: 0,
-            view_size: ViewRect::default(),
-            sample_pos: 0,
-            is_active: false,
+            sample_rate_bits: AtomicU64::new(48000.0f64.to_bits()),
+            max_block_size: AtomicUsize::new(512),
+            latency: AtomicU32::new(0),
+            view_size: Mutex::new(ViewRect::default()),
+            sample_pos: AtomicI64::new(0),
+            is_active: AtomicBool::new(false),
         };
 
         // Initialize audio engine parameters
@@ -237,21 +247,43 @@ impl Vst3Plugin {
         Ok(plugin)
     }
 
-    pub fn setup_audio(&mut self, sample_rate: f64, max_block_size: usize) -> Result<(), String> {
+    pub fn sample_rate(&self) -> f64 {
+        f64::from_bits(self.sample_rate_bits.load(Ordering::Acquire))
+    }
+
+    pub fn max_block_size(&self) -> usize {
+        self.max_block_size.load(Ordering::Acquire)
+    }
+
+    /// Processing delay reported by the plugin, in samples
+    pub fn latency(&self) -> u32 {
+        self.latency.load(Ordering::Acquire)
+    }
+
+    pub fn view_size(&self) -> ViewRect {
+        *self.view_size.lock()
+    }
+
+    /// Samples processed since the last `seek`
+    pub fn sample_pos(&self) -> i64 {
+        self.sample_pos.load(Ordering::Acquire)
+    }
+
+    /// Reconfigure rate and block size. Must not run concurrently with `process_stereo`.
+    pub fn setup_audio(&self, sample_rate: f64, max_block_size: usize) -> Result<(), String> {
         let max_block_size = max_block_size.max(1);
-        self.sample_rate = sample_rate;
-        self.max_block_size = max_block_size;
+        self.sample_rate_bits.store(sample_rate.to_bits(), Ordering::Release);
+        self.max_block_size.store(max_block_size, Ordering::Release);
 
         let comp_vtbl = unsafe { &*(*(self.component as *mut *const IComponentVtbl)) };
         let proc_vtbl = unsafe { &*(*(self.processor as *mut *const IAudioProcessorVtbl)) };
 
         // VST3 requires bus arrangements and setupProcessing to happen while the component is inactive
-        if self.is_active {
+        if self.is_active.swap(false, Ordering::AcqRel) {
             unsafe {
                 let _ = (proc_vtbl.set_processing)(self.processor, 0);
                 let _ = (comp_vtbl.set_active)(self.component, 0);
             }
-            self.is_active = false;
         }
 
         // Stereo bus arrangement (Left + Right = 0x03)
@@ -284,17 +316,15 @@ impl Vst3Plugin {
             let _ = (comp_vtbl.activate_bus)(self.component, K_AUDIO, K_OUTPUT, 0, 1);
             let _ = (comp_vtbl.set_active)(self.component, 1);
             let _ = (proc_vtbl.set_processing)(self.processor, 1);
-            self.latency = (proc_vtbl.get_latency_samples)(self.processor);
+            self.latency.store((proc_vtbl.get_latency_samples)(self.processor), Ordering::Release);
         }
-        self.is_active = true;
+        self.is_active.store(true, Ordering::Release);
 
         Ok(())
     }
 
-    pub fn create_view(&mut self, parent_hwnd: HWND) -> Result<ViewRect, String> {
-        if !self.view.is_null() {
-            self.destroy_view();
-        }
+    pub fn create_view(&self, parent_hwnd: HWND) -> Result<ViewRect, String> {
+        self.destroy_view();
 
         let ctrl_vtbl = unsafe { &*(*(self.controller as *mut *const IEditControllerVtbl)) };
         let editor_name = CString::new("editor").unwrap();
@@ -304,21 +334,21 @@ impl Vst3Plugin {
             return Err("IEditController::create_view(\"editor\") returned null".to_string());
         }
 
-        self.view = view_ptr;
-        let view_vtbl = unsafe { &*(*(self.view as *mut *const IPlugViewVtbl)) };
+        self.view.store(view_ptr, Ordering::Release);
+        let view_vtbl = unsafe { &*(*(view_ptr as *mut *const IPlugViewVtbl)) };
 
         let platform_hwnd = CString::new("HWND").unwrap();
-        let is_supp = unsafe { (view_vtbl.is_platform_type_supported)(self.view, platform_hwnd.as_ptr()) };
+        let is_supp = unsafe { (view_vtbl.is_platform_type_supported)(view_ptr, platform_hwnd.as_ptr()) };
         if is_supp != K_RESULT_OK {
             return Err("IPlugView does not support platform HWND".to_string());
         }
 
         let mut rect = ViewRect::default();
-        let r = unsafe { (view_vtbl.get_size)(self.view, &mut rect) };
+        let r = unsafe { (view_vtbl.get_size)(view_ptr, &mut rect) };
         if r != K_RESULT_OK {
             rect = ViewRect { left: 0, top: 0, right: 1024, bottom: 680 };
         }
-        self.view_size = rect;
+        *self.view_size.lock() = rect;
 
         // Set PlugFrame for dynamic resize notifications
         let parent_raw = parent_hwnd.0 as usize;
@@ -335,50 +365,56 @@ impl Vst3Plugin {
                 }
             }
         });
-        self.plug_frame = plug_frame;
+        self.plug_frame.store(plug_frame, Ordering::Release);
         unsafe {
-            let _ = (view_vtbl.set_frame)(self.view, plug_frame as *mut c_void);
+            let _ = (view_vtbl.set_frame)(view_ptr, plug_frame as *mut c_void);
         }
 
         // Attach view to parent HWND container
         let r_attach = unsafe {
-            (view_vtbl.attached)(self.view, parent_hwnd.0 as *mut c_void, platform_hwnd.as_ptr())
+            (view_vtbl.attached)(view_ptr, parent_hwnd.0 as *mut c_void, platform_hwnd.as_ptr())
         };
         if r_attach != K_RESULT_OK {
             return Err(format!("IPlugView::attached failed with code 0x{:08X}", r_attach));
         }
 
-        Ok(self.view_size)
+        Ok(rect)
     }
 
-    pub fn destroy_view(&mut self) {
-        if !self.view.is_null() {
-            let view_vtbl = unsafe { &*(*(self.view as *mut *const IPlugViewVtbl)) };
+    /// Detach and release the editor (UI thread only)
+    pub fn destroy_view(&self) {
+        let view = self.view.swap(ptr::null_mut(), Ordering::AcqRel);
+        if !view.is_null() {
+            let view_vtbl = unsafe { &*(*(view as *mut *const IPlugViewVtbl)) };
             unsafe {
-                let _ = (view_vtbl.removed)(self.view);
-                let _ = (view_vtbl.base.release)(self.view);
+                let _ = (view_vtbl.removed)(view);
+                let _ = (view_vtbl.base.release)(view);
             }
-            self.view = ptr::null_mut();
         }
-        if !self.plug_frame.is_null() {
+        let frame = self.plug_frame.swap(ptr::null_mut(), Ordering::AcqRel);
+        if !frame.is_null() {
             unsafe {
-                let frame_vtbl = &*(*(self.plug_frame as *mut *const IPlugFrameVtbl));
-                let _ = (frame_vtbl.base.release)(self.plug_frame as *mut c_void);
+                let frame_vtbl = &*(*(frame as *mut *const IPlugFrameVtbl));
+                let _ = (frame_vtbl.base.release)(frame as *mut c_void);
             }
-            self.plug_frame = ptr::null_mut();
         }
+    }
+
+    pub fn has_view(&self) -> bool {
+        !self.view.load(Ordering::Acquire).is_null()
     }
 
     pub fn on_wheel(&self, distance: f32) {
-        if !self.view.is_null() {
-            let view_vtbl = unsafe { &*(*(self.view as *mut *const IPlugViewVtbl)) };
-            let _ = unsafe { (view_vtbl.on_wheel)(self.view, distance) };
+        let view = self.view.load(Ordering::Acquire);
+        if !view.is_null() {
+            let view_vtbl = unsafe { &*(*(view as *mut *const IPlugViewVtbl)) };
+            let _ = unsafe { (view_vtbl.on_wheel)(view, distance) };
         }
     }
 
     /// Process a stereo buffer of any length, split into blocks no larger than `max_block_size`
     pub fn process_stereo(
-        &mut self,
+        &self,
         in_l: &[f32],
         in_r: &[f32],
         out_l: &mut [f32],
@@ -388,7 +424,7 @@ impl Vst3Plugin {
         if num_samples == 0 || self.processor.is_null() {
             return;
         }
-        let block = self.max_block_size.max(1);
+        let block = self.max_block_size().max(1);
         let mut offset = 0;
         while offset < num_samples {
             let end = (offset + block).min(num_samples);
@@ -403,7 +439,7 @@ impl Vst3Plugin {
     }
 
     fn process_block(
-        &mut self,
+        &self,
         in_l: &[f32],
         in_r: &[f32],
         out_l: &mut [f32],
@@ -430,10 +466,10 @@ impl Vst3Plugin {
 
         let mut context = ProcessContext {
             state: (1 << 1) | (1 << 8) | (1 << 9) | (1 << 13) | (1 << 14), // kPlaying, kSystemTimeValid, kContTimeValid, kTempoValid, kTimeSigValid
-            sample_rate: self.sample_rate,
-            project_time_samples: self.sample_pos,
+            sample_rate: self.sample_rate(),
+            project_time_samples: self.sample_pos(),
             system_time: 0,
-            continuous_time_samples: self.sample_pos,
+            continuous_time_samples: self.sample_pos(),
             project_time_music: 0.0,
             bar_position_music: 0.0,
             cycle_start_music: 0.0,
@@ -467,11 +503,11 @@ impl Vst3Plugin {
         unsafe {
             let _ = (proc_vtbl.process)(self.processor, &mut process_data);
         }
-        self.sample_pos += num_samples as i64;
+        self.sample_pos.fetch_add(num_samples as i64, Ordering::AcqRel);
     }
 
-    pub fn seek(&mut self, sample_pos: i64) {
-        self.sample_pos = sample_pos;
+    pub fn seek(&self, sample_pos: i64) {
+        self.sample_pos.store(sample_pos, Ordering::Release);
     }
 
     /// Save the plugin's complete serialized state to bytes
@@ -499,7 +535,7 @@ impl Vst3Plugin {
     }
 
     /// Load a serialized state into the plugin and synchronize it to the controller
-    pub fn load_state(&mut self, data: &[u8]) -> Result<(), String> {
+    pub fn load_state(&self, data: &[u8]) -> Result<(), String> {
         if self.component.is_null() || self.controller.is_null() {
             return Err("Component or Controller is null".to_string());
         }
@@ -538,7 +574,7 @@ impl Drop for Vst3Plugin {
         if !self.processor.is_null() {
             let proc_vtbl = unsafe { &*(*(self.processor as *mut *const IAudioProcessorVtbl)) };
             unsafe {
-                if self.is_active {
+                if self.is_active.load(Ordering::Acquire) {
                     let _ = (proc_vtbl.set_processing)(self.processor, 0);
                 }
                 let _ = (proc_vtbl.base.release)(self.processor);
@@ -549,7 +585,7 @@ impl Drop for Vst3Plugin {
         if !self.component.is_null() {
             let comp_vtbl = unsafe { &*(*(self.component as *mut *const IComponentVtbl)) };
             unsafe {
-                if self.is_active {
+                if self.is_active.load(Ordering::Acquire) {
                     let _ = (comp_vtbl.set_active)(self.component, 0);
                 }
                 let _ = (comp_vtbl.terminate)(self.component);

@@ -364,6 +364,12 @@ impl Module for SpectralShaper {
     fn status(&self) -> Option<String> {
         Some(format!("Peak reduction: {:.1} dB", self.max_reduction))
     }
+    fn meters(&self) -> [f32; 4] {
+        [self.max_reduction, 0.0, 0.0, 0.0]
+    }
+    fn set_meters(&mut self, m: [f32; 4]) {
+        self.max_reduction = m[0];
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -501,8 +507,18 @@ impl Module for TonalStabilizer {
     }
     fn latency(&self) -> usize { self.stft.latency() }
     fn status(&self) -> Option<String> {
-        let (lo, hi) = self.correction_db.iter().fold((0.0f32, 0.0f32), |(a, b), &c| (a.min(c), b.max(c)));
+        let [lo, hi, _, _] = self.meters();
         Some(format!("Correction: {:+.1} .. {:+.1} dB", lo, hi))
+    }
+    fn meters(&self) -> [f32; 4] {
+        let (lo, hi) = self.correction_db.iter().fold((0.0f32, 0.0f32), |(a, b), &c| (a.min(c), b.max(c)));
+        [lo, hi, 0.0, 0.0]
+    }
+    fn set_meters(&mut self, m: [f32; 4]) {
+        // The UI copy only needs the range: spread it over the bands so `meters` reproduces it
+        self.correction_db = [0.0; STAB_BANDS];
+        self.correction_db[0] = m[0];
+        self.correction_db[1] = m[1];
     }
 }
 

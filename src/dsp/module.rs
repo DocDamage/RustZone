@@ -109,6 +109,12 @@ pub trait Module {
     fn status(&self) -> Option<String> {
         None
     }
+    /// Live values (gain reduction...) published from the audio thread's copy of the module
+    fn meters(&self) -> [f32; 4] {
+        [0.0; 4]
+    }
+    /// Receive published live values on the UI's copy, so `status` reads them
+    fn set_meters(&mut self, _meters: [f32; 4]) {}
 }
 
 macro_rules! module_kinds {
@@ -119,6 +125,12 @@ macro_rules! module_kinds {
 
         impl ModuleKind {
             pub const ALL: &'static [ModuleKind] = &[ $( ModuleKind::$variant, )* ];
+            pub const COUNT: usize = [ $( stringify!($variant), )* ].len();
+
+            /// Position in `ALL`
+            pub fn index(self) -> usize {
+                self as usize
+            }
 
             /// Stable identifier used in presets
             pub fn key(self) -> &'static str {

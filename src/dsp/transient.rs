@@ -327,6 +327,12 @@ impl Module for TransientRestore {
     fn status(&self) -> Option<String> {
         Some(format!("Transient boost: {:.1} dB", self.last_gain_db))
     }
+    fn meters(&self) -> [f32; 4] {
+        [self.last_gain_db, 0.0, 0.0, 0.0]
+    }
+    fn set_meters(&mut self, m: [f32; 4]) {
+        self.last_gain_db = m[0];
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

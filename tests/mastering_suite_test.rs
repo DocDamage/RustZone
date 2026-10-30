@@ -81,7 +81,7 @@ fn test_fallback_vst3_processing_state_and_view() {
         return;
     };
 
-    let mut plugin = Vst3Plugin::load(&vst3_path).expect("Failed to load VST3 plugin");
+    let plugin = Vst3Plugin::load(&vst3_path).expect("Failed to load VST3 plugin");
     let in_l = vec![0.1f32; 512];
     let in_r = vec![0.1f32; 512];
     let mut out_l = vec![0.0f32; 512];
@@ -530,6 +530,7 @@ fn test_render_to_wav_with_resampling() {
         bwf_metadata: None,
         target_sample_rate: Some(target_sr),
         dither: None,
+        stems: None,
     };
 
     let r = render_to_wav(
@@ -839,10 +840,10 @@ fn test_vst3_reconfigure_and_oversized_block() {
         return;
     };
 
-    let mut plugin = Vst3Plugin::load(&vst3_path).expect("Failed to load VST3 plugin");
+    let plugin = Vst3Plugin::load(&vst3_path).expect("Failed to load VST3 plugin");
     // Reconfigure while active (device rate change), then feed more frames than max_block_size
     plugin.setup_audio(44100.0, 256).expect("reconfigure to 44.1 kHz failed");
-    assert_eq!(plugin.max_block_size, 256);
+    assert_eq!(plugin.max_block_size(), 256);
 
     let n = 1500;
     let in_l: Vec<f32> = (0..n).map(|i| (i as f32 * 0.03).sin() * 0.2).collect();
@@ -851,7 +852,7 @@ fn test_vst3_reconfigure_and_oversized_block() {
     let mut out_r = vec![0.0f32; n];
     plugin.process_stereo(&in_l, &in_r, &mut out_l, &mut out_r);
 
-    assert_eq!(plugin.sample_pos, n as i64, "every frame should be processed across chunks");
+    assert_eq!(plugin.sample_pos(), n as i64, "every frame should be processed across chunks");
     assert!(out_l.iter().chain(out_r.iter()).all(|s| s.is_finite()));
 
     plugin.setup_audio(48000.0, 2048).expect("second reconfigure failed");

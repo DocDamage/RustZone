@@ -15,7 +15,7 @@ A chain of 19 modules. Each one can be switched on or off independently, and the
 | **Equalizer (8-band dynamic)** | HP / shelves / bells / LP. Each band can be Stereo, Mid or Side, with optional dynamic gain. |
 | **Vintage Passive EQ** | Passive-style program EQ: simultaneous low boost and cut, broad high boost, high shelf cut, transformer drive. |
 | **Match EQ** | Learns the tonal balance of a reference track and applies the difference. Adjustable smoothing, amount and maximum correction. |
-| **Stem EQ** | Separate low / mid / high EQ for vocals, bass, drums and other, using real-time stem masks. |
+| **Stem EQ** | Separate low / mid / high EQ for vocals, bass, drums and other. |
 | **Stem Rebalance** | Turn vocals, bass, drums or everything else up or down inside a finished mix. |
 | **Low-End Shaper** | Adds punch to, or smooths, kick and bass transients below an adjustable cutoff. |
 | **Bass Enhancer** | Tightens and boosts the sub band, adds harmonics so bass translates on small speakers, and can make the low end mono. |
@@ -32,7 +32,14 @@ A chain of 19 modules. Each one can be switched on or off independently, and the
 | **Vintage Opto Limiter** | Smooth, program-dependent limiting with Analog / Tube / Modern colour and a hard ceiling. |
 | **True-Peak Maximizer** | 2 ms lookahead limiter with 4× true-peak detection and adaptive release. |
 
-All modules are original implementations. The spectral modules (Match EQ, Stem EQ, Stem Rebalance, Spectral Shaper, Tonal Stabilizer) share one streaming FFT engine (2048-point, 75% overlap) that reconstructs the signal exactly at neutral settings. Each adds 2048 samples of latency while enabled. The total is shown in the editor and compensated on export.
+**AI stem separation.** Stem Rebalance and Stem EQ start as real-time approximations (spectral stem masks). Click **Separate stems (AI)** in either module and the bundled HTDemucs model splits the track into drums, bass, other and vocals in the background (on a CPU it takes about as long as the track plays). From then on both modules work on the real stems, during playback and export, with no added latency. The stem mixer's Auto-Separate uses the same model. See [`models/README.md`](models/README.md) for the model's origin and licence.
+
+All DSP modules are original implementations. The spectral modules (Match EQ, Stem EQ, Stem Rebalance, Spectral Shaper, Tonal Stabilizer) share one streaming FFT engine (2048-point, 75% overlap) that reconstructs the signal exactly at neutral settings. Each adds 2048 samples of latency while enabled. The total is shown in the editor and compensated on export.
+
+### Honest comparisons
+
+- **Loudness-matched A/B (`G`):** the processed signal plays back at the input's loudness, so a louder master can't win a comparison just by being louder. The correction is shown in the meter line (monitoring only; exports are unaffected).
+- **Per-module auto gain-match:** the **Auto gain-match** button on each module measures loudness before and after it and trims its output, so tweaking or toggling a module changes tone rather than level.
 
 ### Editing the chain
 
@@ -69,6 +76,7 @@ Choose **Load VST3 plugin (fallback)...** in the processor list, or pick a plugi
 | `Esc` | Stop and rewind |
 | `←` / `→` | Scrub ±5 s |
 | `B` | A/B: processed vs. dry |
+| `G` | Loudness-matched A/B on/off |
 | `L` | Loop |
 | `R` | Toggle reference track |
 | `A` | Master Assistant |
@@ -85,7 +93,7 @@ Choose **Load VST3 plugin (fallback)...** in the processor list, or pick a plugi
 
 ## 🚀 Building and running
 
-Requires the Rust MSVC toolchain.
+Requires the Rust MSVC toolchain and [Git LFS](https://git-lfs.com) (for the model file). The first build downloads a prebuilt ONNX Runtime through the `ort` crate.
 
 ```powershell
 cargo build --release
@@ -100,7 +108,11 @@ Pass an audio file path as the first argument to open it on launch. `install_she
 cargo test -- --test-threads=1
 ```
 
-The fallback-plugin tests only run when `MASTERING_STUDIO_TEST_VST3` points at a `.vst3` file; otherwise they skip.
+The fallback-plugin tests only run when `MASTERING_STUDIO_TEST_VST3` points at a `.vst3` file; otherwise they skip. `engine_realtime_test` needs an audio output device, and `ml_separation_test` needs the model file.
+
+### Real-time design
+
+The audio callback owns everything it processes (suite, track, plugin, stems) and never waits on a lock. The UI keeps its own copy of the suite and sends every change through a lock-free queue; whatever the audio thread replaces is handed back to the UI thread to be freed. Meters and module readouts come back through atomics and a snapshot the audio thread only updates when nobody is reading it.
 
 ---
 
@@ -108,8 +120,8 @@ The fallback-plugin tests only run when `MASTERING_STUDIO_TEST_VST3` points at a
 
 ```
 src/
-├── audio/        buffer, decoder, CPAL engine, renderer (latency, dither, resampling), resampler,
-│                 montage, stems & separator, trim/fades, BWF metadata
+├── audio/        buffer, decoder, lock-free CPAL engine, renderer (latency, dither, resampling),
+│                 resampler, montage, stems & separator, ml_separator (HTDemucs), trim/fades, BWF
 ├── dsp/
 │   ├── module.rs        Module trait, parameter descriptions, module registry
 │   ├── stft.rs          Streaming STFT shared by the spectral modules
@@ -125,7 +137,10 @@ src/
 ├── vst3/         Generic VST3 host (fallback plugins only)
 ├── lib.rs
 └── main.rs
+models/           htdemucs.onnx (Git LFS) and its licence
 tests/
 ├── mastering_suite_test.rs   engine, export, montage, stems, presets, metering
-└── module_suite_test.rs      behaviour of the suite's modules
+├── module_suite_test.rs      behaviour of the suite's modules
+├── engine_realtime_test.rs   command queue, loudness-matched A/B, auto gain
+└── ml_separation_test.rs     trained stem separation and rebalance on stems
 ```

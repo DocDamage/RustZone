@@ -13,6 +13,8 @@ rfd = "0.15"
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
 ringbuf = "0.4"
+# ONNX Runtime for the bundled HTDemucs stem-separation model
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "download-binaries"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
