@@ -262,11 +262,18 @@ pub struct IConnectionPointVtbl {
     pub notify: unsafe extern "system" fn(this: *mut c_void, message: *mut c_void) -> i32,
 }
 
+/// Standard VST3 `Vst::IAttributeList` (ivstattributes.h), in vtable order
 #[repr(C)]
 pub struct IAttributeListVtbl {
     pub base: FUnknownVtbl,
-    pub set_binary: unsafe extern "system" fn(this: *mut c_void, id: *const c_char, data: *const c_void) -> i32,
-    pub get_binary: unsafe extern "system" fn(this: *mut c_void, id: *const c_char, data: *mut *const c_void) -> i32,
+    pub set_int: unsafe extern "system" fn(this: *mut c_void, id: *const c_char, value: i64) -> i32,
+    pub get_int: unsafe extern "system" fn(this: *mut c_void, id: *const c_char, value: *mut i64) -> i32,
+    pub set_float: unsafe extern "system" fn(this: *mut c_void, id: *const c_char, value: f64) -> i32,
+    pub get_float: unsafe extern "system" fn(this: *mut c_void, id: *const c_char, value: *mut f64) -> i32,
+    pub set_string: unsafe extern "system" fn(this: *mut c_void, id: *const c_char, string: *const u16) -> i32,
+    pub get_string: unsafe extern "system" fn(this: *mut c_void, id: *const c_char, string: *mut u16, size_in_bytes: u32) -> i32,
+    pub set_binary: unsafe extern "system" fn(this: *mut c_void, id: *const c_char, data: *const c_void, size_in_bytes: u32) -> i32,
+    pub get_binary: unsafe extern "system" fn(this: *mut c_void, id: *const c_char, data: *mut *const c_void, size_in_bytes: *mut u32) -> i32,
 }
 
 #[repr(C)]

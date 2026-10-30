@@ -13,7 +13,7 @@ pub mod trim;
 pub use buffer::AudioBuffer;
 pub use bwf::BwfMetadata;
 pub use decoder::load_audio_file;
-pub use engine::{AudioDeviceInfo, AudioEngine, MeterLevels, ProcessingMode};
+pub use engine::{list_audio_hosts, list_output_devices, AudioDeviceInfo, AudioEngine, DeviceChoice, MeterLevels, OutputDeviceInfo, ProcessingMode, StemStatus};
 pub use ml_separator::{DemucsSeparator, StemBus, StemSet};
 pub use montage::{AlbumMontage, MontageTrack};
 pub use renderer::{render_to_wav, ExportBitDepth, RenderOptions, RenderSource};

@@ -2,6 +2,8 @@
 
 A standalone audio mastering workstation for Windows, written in Rust. Its built-in mastering suite covers EQ, dynamics, stereo, saturation, spectral and stem-aware processing, limiting, metering, referencing, album sequencing and export. It needs no external plugins. VST3 plugins can still be loaded, but only as optional fallback processors.
 
+![Mastering Studio: the built-in suite with the EQ curve](docs/screenshot.png)
+
 ---
 
 ## ✨ Features
@@ -41,11 +43,19 @@ All DSP modules are original implementations. The spectral modules (Match EQ, St
 - **Loudness-matched A/B (`G`):** the processed signal plays back at the input's loudness, so a louder master can't win a comparison just by being louder. The correction is shown in the meter line (monitoring only; exports are unaffected).
 - **Per-module auto gain-match:** the **Auto gain-match** button on each module measures loudness before and after it and trims its output, so tweaking or toggling a module changes tone rather than level.
 
-### Editing the chain
+### Working in the suite
 
-- **Chain (left):** click a module to edit it, click its ON/OFF box to switch it, and turn the mouse wheel over it to move it earlier or later in the chain.
-- **Parameters (right):** turn the mouse wheel over a row to change it (hold Shift for fine steps). Left-click steps up and right-click steps down; toggles flip and choices cycle.
-- **Match EQ:** load a reference track (**+ Ref Track**), select Match EQ, and click **Learn from reference track**.
+- **Signal chain (left):** tick a module to switch it on, click its name to edit it, and use the arrows to reorder. The chain's total latency is shown underneath.
+- **Module editor (right):** every parameter as a slider, checkbox or menu. Modules with dynamics show live gain-reduction meters.
+- **Equalizer:** an interactive curve over the live spectrum. Drag a band's node to move its frequency and gain, scroll over it to change Q, and pick a band to show only its controls.
+- **Auto gain-match** and **Learn from reference track** (Match EQ) / **Separate stems (AI)** (Stem Rebalance, Stem EQ) sit in each module's header.
+- **MIDI learn:** right-click any parameter name, choose *MIDI learn*, then move a controller. Mapped parameters are highlighted.
+
+### Undo, snapshots and sessions
+
+- **Undo / redo** (`Ctrl+Z` / `Ctrl+Y`) covers every suite change: parameters, module on/off, chain order, auto gain, presets, the Assistant, loudness targets and Match EQ learning. A slider drag or wheel spin counts as one step.
+- **Snapshots A/B/C/D** (`Ctrl+1`–`Ctrl+4`) hold four complete chain settings for comparison. Switching away keeps your edits in that slot; right-click a slot to copy the current settings into it.
+- **Sessions** (`.mstsession`, `Ctrl+S`) save the track and reference paths, the full suite, the snapshots, trim and fades, loudness-matched A/B, the album and the export and target choices.
 
 ### Workflow
 
@@ -60,11 +70,12 @@ All DSP modules are original implementations. The spectral modules (Match EQ, St
 - **Export:** 16-bit, 24-bit or 32-bit float WAV with optional sinc resampling. Integer formats get dither (noise-shaped for 16-bit, TPDF for 24-bit). Latency is compensated and BWF metadata is written. Batch-processes whole folders.
 - **Presets:** `.xml` presets hold the chain order, every module's state and parameters, and any learned Match EQ curve. Factory presets in the element/param XML layout can also be imported.
 - **Drag and drop** audio files onto the window. Dropped files are added to the album in montage mode.
-- **MIDI control** of key parameters and transport.
+- **MIDI control:** CC 1 drives the exciter, CC 7 maximizer drive, CC 10 stereo width, CC 64 play/pause and CC 80 the reference, plus notes 36 / 38 / 40 / 41 for play, stop, reference and bypass. Learned mappings override these.
+- **Audio device:** pick the driver, output, sample rate and buffer size (**Audio device…**, `H`). The track, suite, plugin and stems carry over. ASIO is available when built with `--features asio` (needs Steinberg's ASIO SDK: set `CPAL_ASIO_DIR`, and install LLVM for bindgen).
 
 ### Fallback VST3 hosting (optional)
 
-Choose **Load VST3 plugin (fallback)...** in the processor list, or pick a plugin found in `C:\Program Files\Common Files\VST3` or a `plugins` folder next to the executable. The plugin runs at the device rate with its editor docked in the window, and its state can be saved and loaded as `.vststate`. The built-in suite is always the default; nothing in the app depends on a plugin being installed.
+Choose **Load VST3 plugin (fallback)...** in the processor list, or pick a plugin found in `C:\Program Files\Common Files\VST3` or a `plugins` folder next to the executable. The plugin runs at the device rate, its editor opens in its own window (**Plugin editor** reopens it), and its state can be saved and loaded as `.vststate`. The host implements the standard VST3 interfaces and is tested with third-party plugins. The built-in suite is always the default; nothing in the app depends on a plugin being installed.
 
 ---
 
@@ -87,7 +98,10 @@ Choose **Load VST3 plugin (fallback)...** in the processor list, or pick a plugi
 | `H` | Audio device info |
 | `[` / `]` | Trim in / out at playhead |
 | `F` / `C` | Cycle fades / clear trim and fades |
-| `Ctrl+O` / `Ctrl+E` / `Ctrl+S` | Open / export / save preset |
+| `Ctrl+O` / `Ctrl+E` / `Ctrl+S` | Open track / export / save session |
+| `Ctrl+Z` / `Ctrl+Y` | Undo / redo |
+| `Ctrl+1`–`Ctrl+4` | Snapshot A–D |
+| Waveform | Click/drag to seek • Shift+click sets trim in • right-click sets trim out |
 
 ---
 
@@ -100,7 +114,7 @@ cargo build --release
 .\target\release\mastering_studio.exe
 ```
 
-Pass an audio file path as the first argument to open it on launch. `install_shell_context_menu.reg` adds a "Master with Mastering Studio" entry to Explorer; edit the paths in it if your checkout is not at `D:\dev\ozone clone`.
+Pass an audio file path as the first argument to open it on launch. `--screenshot out.png [--view suite|album|stems] [--module equalizer]` renders the window to a PNG and exits (used for docs and UI checks; it never starts playback). `install_shell_context_menu.reg` adds a "Master with Mastering Studio" entry to Explorer; edit the paths in it if your checkout is not at `D:\dev\ozone clone`.
 
 ### Tests
 
@@ -108,7 +122,7 @@ Pass an audio file path as the first argument to open it on launch. `install_she
 cargo test -- --test-threads=1
 ```
 
-The fallback-plugin tests only run when `MASTERING_STUDIO_TEST_VST3` points at a `.vst3` file; otherwise they skip. `engine_realtime_test` needs an audio output device, and `ml_separation_test` needs the model file.
+The fallback-plugin tests only run when `MASTERING_STUDIO_TEST_VST3` points at a `.vst3` file (e.g. any installed third-party plugin); otherwise they skip. `engine_realtime_test` needs an audio output device, and `ml_separation_test` needs the model file.
 
 ### Real-time design
 
@@ -132,8 +146,10 @@ src/
 │   ├── mod.rs           MasteringSuite (ordered chain), biquads, imager, exciter
 │   └── ...              EQ, multiband, maximizer, clarity, dither, LUFS / true peak, FFT analyzer,
 │                        assistant, XML presets
-├── midi/         WinMM MIDI input
-├── ui/           Win32 workstation UI; dsp_panel.rs is the suite editor
+├── midi/         WinMM MIDI input, delivered as events on a channel
+├── session.rs    Undo/redo history, A-D snapshots, session files
+├── ui/           egui interface: app (toolbar, transport, dialogs, jobs), suite_view,
+│                 album_view, stems_view, widgets (meters, waveform, EQ curve), plugin_window
 ├── vst3/         Generic VST3 host (fallback plugins only)
 ├── lib.rs
 └── main.rs
@@ -141,6 +157,7 @@ models/           htdemucs.onnx (Git LFS) and its licence
 tests/
 ├── mastering_suite_test.rs   engine, export, montage, stems, presets, metering
 ├── module_suite_test.rs      behaviour of the suite's modules
-├── engine_realtime_test.rs   command queue, loudness-matched A/B, auto gain
+├── engine_realtime_test.rs   command queue, A/B match, auto gain, device switching
+├── session_test.rs           undo/redo, snapshots, session round trip
 └── ml_separation_test.rs     trained stem separation and rebalance on stems
 ```

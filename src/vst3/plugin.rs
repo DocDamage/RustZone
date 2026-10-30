@@ -353,16 +353,19 @@ impl Vst3Plugin {
         // Set PlugFrame for dynamic resize notifications
         let parent_raw = parent_hwnd.0 as usize;
         let plug_frame = create_plug_frame(move |new_rect| {
-            println!("Plugin requested resize: {}x{}", new_rect.width(), new_rect.height());
+            // Grow or shrink the host window so its client area fits the editor
             unsafe {
-                use windows::Win32::UI::WindowsAndMessaging::{GetParent, SetWindowPos, SWP_NOMOVE, SWP_NOZORDER};
+                use windows::Win32::Foundation::RECT;
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    AdjustWindowRectEx, GetWindowLongW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE, SWP_NOMOVE, SWP_NOZORDER,
+                    WINDOW_EX_STYLE, WINDOW_STYLE,
+                };
                 let parent = HWND(parent_raw as *mut _);
-                let _ = SetWindowPos(parent, None, 0, 0, new_rect.width(), new_rect.height(), SWP_NOZORDER | SWP_NOMOVE);
-                if let Ok(grandparent) = GetParent(parent) {
-                    let req_w = (new_rect.width() + 50).max(1200);
-                    let req_h = (new_rect.height() + 150).max(750);
-                    let _ = SetWindowPos(grandparent, None, 0, 0, req_w, req_h, SWP_NOZORDER | SWP_NOMOVE);
-                }
+                let mut r = RECT { left: 0, top: 0, right: new_rect.width(), bottom: new_rect.height() };
+                let style = WINDOW_STYLE(GetWindowLongW(parent, GWL_STYLE) as u32);
+                let ex = WINDOW_EX_STYLE(GetWindowLongW(parent, GWL_EXSTYLE) as u32);
+                let _ = AdjustWindowRectEx(&mut r, style, false, ex);
+                let _ = SetWindowPos(parent, None, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOMOVE);
             }
         });
         self.plug_frame.store(plug_frame, Ordering::Release);

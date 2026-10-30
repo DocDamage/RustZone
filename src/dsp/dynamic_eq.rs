@@ -91,6 +91,22 @@ impl EqBand {
         self.update_coefficients(gain_db);
     }
 
+    /// Magnitude response in dB at `freq` with the band's current (static) coefficients
+    pub fn response_db(&self, freq: f32) -> f32 {
+        if !self.enabled {
+            return 0.0;
+        }
+        let w = 2.0 * PI * freq / self.sample_rate.max(1.0);
+        let (c1, s1, c2, s2) = (w.cos(), w.sin(), (2.0 * w).cos(), (2.0 * w).sin());
+        let num_re = self.b0 + self.b1 * c1 + self.b2 * c2;
+        let num_im = -(self.b1 * s1 + self.b2 * s2);
+        let den_re = 1.0 + self.a1 * c1 + self.a2 * c2;
+        let den_im = -(self.a1 * s1 + self.a2 * s2);
+        let num = (num_re * num_re + num_im * num_im).max(1e-20);
+        let den = (den_re * den_re + den_im * den_im).max(1e-20);
+        10.0 * (num / den).log10()
+    }
+
     pub fn reset_state(&mut self) {
         self.z1_l = 0.0;
         self.z2_l = 0.0;

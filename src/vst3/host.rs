@@ -15,10 +15,18 @@ pub struct ComObject<T, V> {
 }
 
 // ----------------------------------------------------------------------------
-// HostAttributeList
+// HostAttributeList: the standard typed key/value store plugins attach to IMessages
 // ----------------------------------------------------------------------------
+pub enum AttrValue {
+    Int(i64),
+    Float(f64),
+    /// UTF-16 without terminator
+    String(Vec<u16>),
+    Binary(Vec<u8>),
+}
+
 pub struct HostAttributeListData {
-    pub binaries: Mutex<HashMap<String, *const c_void>>,
+    pub values: Mutex<HashMap<String, AttrValue>>,
 }
 
 pub type HostAttributeListCom = ComObject<HostAttributeListData, IAttributeListVtbl>;
@@ -29,8 +37,14 @@ static ATTR_LIST_VTBL: IAttributeListVtbl = IAttributeListVtbl {
         add_ref: attr_list_add_ref,
         release: attr_list_release,
     },
-    set_binary: attr_list_set_binary,
-    get_binary: attr_list_get_binary,
+    set_int: attr_set_int,
+    get_int: attr_get_int,
+    set_float: attr_set_float,
+    get_float: attr_get_float,
+    set_string: attr_set_string,
+    get_string: attr_get_string,
+    set_binary: attr_set_binary,
+    get_binary: attr_get_binary,
 };
 
 unsafe extern "system" fn attr_list_qi(this: *mut c_void, iid: *const TUID, obj: *mut *mut c_void) -> i32 {
@@ -64,43 +78,119 @@ unsafe extern "system" fn attr_list_release(this: *mut c_void) -> u32 {
     }
 }
 
-unsafe extern "system" fn attr_list_set_binary(
-    this: *mut c_void,
-    id: *const c_char,
-    data: *const c_void,
-) -> i32 {
-    if this.is_null() || id.is_null() || data.is_null() {
-        return K_INVALID_ARGUMENT;
+/// The list and the attribute key, or None for bad arguments
+unsafe fn attr_key<'a>(this: *mut c_void, id: *const c_char) -> Option<(&'a HostAttributeListData, String)> {
+    if this.is_null() || id.is_null() {
+        return None;
     }
     let com = &*(this as *mut HostAttributeListCom);
-    let key = match CStr::from_ptr(id).to_str() {
-        Ok(k) => k.to_string(),
-        Err(_) => return K_INVALID_ARGUMENT,
-    };
-    com.data.binaries.lock().insert(key, data);
+    let key = CStr::from_ptr(id).to_str().ok()?.to_string();
+    Some((&com.data, key))
+}
+
+unsafe extern "system" fn attr_set_int(this: *mut c_void, id: *const c_char, value: i64) -> i32 {
+    let Some((d, key)) = attr_key(this, id) else { return K_INVALID_ARGUMENT };
+    d.values.lock().insert(key, AttrValue::Int(value));
     K_RESULT_OK
 }
 
-unsafe extern "system" fn attr_list_get_binary(
-    this: *mut c_void,
-    id: *const c_char,
-    data: *mut *const c_void,
-) -> i32 {
-    if this.is_null() || id.is_null() || data.is_null() {
+unsafe extern "system" fn attr_get_int(this: *mut c_void, id: *const c_char, value: *mut i64) -> i32 {
+    let Some((d, key)) = attr_key(this, id) else { return K_INVALID_ARGUMENT };
+    if value.is_null() {
         return K_INVALID_ARGUMENT;
     }
-    let com = &*(this as *mut HostAttributeListCom);
-    let key = match CStr::from_ptr(id).to_str() {
-        Ok(k) => k,
-        Err(_) => return K_INVALID_ARGUMENT,
-    };
-    let map = com.data.binaries.lock();
-    if let Some(&ptr) = map.get(key) {
-        *data = ptr;
-        K_RESULT_OK
+    match d.values.lock().get(&key) {
+        Some(AttrValue::Int(v)) => {
+            *value = *v;
+            K_RESULT_OK
+        }
+        _ => K_RESULT_FALSE,
+    }
+}
+
+unsafe extern "system" fn attr_set_float(this: *mut c_void, id: *const c_char, value: f64) -> i32 {
+    let Some((d, key)) = attr_key(this, id) else { return K_INVALID_ARGUMENT };
+    d.values.lock().insert(key, AttrValue::Float(value));
+    K_RESULT_OK
+}
+
+unsafe extern "system" fn attr_get_float(this: *mut c_void, id: *const c_char, value: *mut f64) -> i32 {
+    let Some((d, key)) = attr_key(this, id) else { return K_INVALID_ARGUMENT };
+    if value.is_null() {
+        return K_INVALID_ARGUMENT;
+    }
+    match d.values.lock().get(&key) {
+        Some(AttrValue::Float(v)) => {
+            *value = *v;
+            K_RESULT_OK
+        }
+        _ => K_RESULT_FALSE,
+    }
+}
+
+unsafe extern "system" fn attr_set_string(this: *mut c_void, id: *const c_char, string: *const u16) -> i32 {
+    let Some((d, key)) = attr_key(this, id) else { return K_INVALID_ARGUMENT };
+    if string.is_null() {
+        return K_INVALID_ARGUMENT;
+    }
+    let mut len = 0usize;
+    while *string.add(len) != 0 && len < (1 << 20) {
+        len += 1;
+    }
+    let text = std::slice::from_raw_parts(string, len).to_vec();
+    d.values.lock().insert(key, AttrValue::String(text));
+    K_RESULT_OK
+}
+
+unsafe extern "system" fn attr_get_string(this: *mut c_void, id: *const c_char, string: *mut u16, size_in_bytes: u32) -> i32 {
+    let Some((d, key)) = attr_key(this, id) else { return K_INVALID_ARGUMENT };
+    if string.is_null() || size_in_bytes < 2 {
+        return K_INVALID_ARGUMENT;
+    }
+    match d.values.lock().get(&key) {
+        Some(AttrValue::String(text)) => {
+            // Copy what fits, always NUL-terminated
+            let capacity = (size_in_bytes / 2) as usize;
+            let n = text.len().min(capacity - 1);
+            ptr::copy_nonoverlapping(text.as_ptr(), string, n);
+            *string.add(n) = 0;
+            K_RESULT_OK
+        }
+        _ => K_RESULT_FALSE,
+    }
+}
+
+unsafe extern "system" fn attr_set_binary(this: *mut c_void, id: *const c_char, data: *const c_void, size_in_bytes: u32) -> i32 {
+    let Some((d, key)) = attr_key(this, id) else { return K_INVALID_ARGUMENT };
+    if data.is_null() && size_in_bytes > 0 {
+        return K_INVALID_ARGUMENT;
+    }
+    let bytes = if size_in_bytes == 0 {
+        Vec::new()
     } else {
-        *data = ptr::null();
-        K_RESULT_FALSE
+        std::slice::from_raw_parts(data as *const u8, size_in_bytes as usize).to_vec()
+    };
+    d.values.lock().insert(key, AttrValue::Binary(bytes));
+    K_RESULT_OK
+}
+
+unsafe extern "system" fn attr_get_binary(this: *mut c_void, id: *const c_char, data: *mut *const c_void, size_in_bytes: *mut u32) -> i32 {
+    let Some((d, key)) = attr_key(this, id) else { return K_INVALID_ARGUMENT };
+    if data.is_null() || size_in_bytes.is_null() {
+        return K_INVALID_ARGUMENT;
+    }
+    // The pointer stays valid for as long as the attribute list (and this entry) lives
+    match d.values.lock().get(&key) {
+        Some(AttrValue::Binary(bytes)) => {
+            *data = bytes.as_ptr() as *const c_void;
+            *size_in_bytes = bytes.len() as u32;
+            K_RESULT_OK
+        }
+        _ => {
+            *data = ptr::null();
+            *size_in_bytes = 0;
+            K_RESULT_FALSE
+        }
     }
 }
 
@@ -109,7 +199,7 @@ pub fn create_attribute_list() -> *mut HostAttributeListCom {
         vtbl: &ATTR_LIST_VTBL,
         ref_count: AtomicU32::new(1),
         data: HostAttributeListData {
-            binaries: Mutex::new(HashMap::new()),
+            values: Mutex::new(HashMap::new()),
         },
     }))
 }

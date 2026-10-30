@@ -94,6 +94,8 @@ type SuiteEdit = Arc<dyn Fn(&mut MasteringSuite) + Send + Sync>;
 /// UI → audio thread
 enum Command {
     EditSuite(SuiteEdit),
+    /// Swap in a fully configured suite (undo, snapshots, presets, sessions)
+    ReplaceSuite(Box<MasteringSuite>),
     SetBuffer(Option<Arc<AudioBuffer>>),
     SetReference(Option<Arc<AudioBuffer>>),
     SetReferenceGain(f32),
@@ -109,6 +111,7 @@ enum Command {
 #[allow(dead_code)]
 enum Garbage {
     Edit(SuiteEdit),
+    Suite(Box<MasteringSuite>),
     Buffer(Arc<AudioBuffer>),
     Plugin(Arc<Vst3Plugin>),
     Stems(Arc<StemSet>),
@@ -225,6 +228,10 @@ impl RtState {
                 Command::EditSuite(edit) => {
                     edit(&mut self.suite);
                     self.discard(Garbage::Edit(edit));
+                }
+                Command::ReplaceSuite(mut suite) => {
+                    std::mem::swap(&mut self.suite, &mut suite);
+                    self.discard(Garbage::Suite(suite));
                 }
                 Command::SetBuffer(buf) => {
                     if let Some(old) = std::mem::replace(&mut self.buffer, buf) {
@@ -343,15 +350,45 @@ impl UiState {
     }
 }
 
+/// What the output stream is running on
+#[derive(Clone, Debug, Default)]
+struct DeviceDesc {
+    host: String,
+    name: String,
+    sample_rate: u32,
+    channels: usize,
+    sample_format: String,
+    buffer_frames: Option<u32>,
+}
+
+/// Which output to open. `None` fields mean "the host's/device's default".
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DeviceChoice {
+    pub host: Option<String>,
+    pub device: Option<String>,
+    pub sample_rate: Option<u32>,
+    /// Requested callback size in frames (devices may round it)
+    pub buffer_frames: Option<u32>,
+}
+
+/// An output device and what it supports
+#[derive(Clone, Debug)]
+pub struct OutputDeviceInfo {
+    pub name: String,
+    pub default_sample_rate: u32,
+    /// Common rates the device accepts for stereo float/int16 output
+    pub sample_rates: Vec<u32>,
+    /// Supported callback size range in frames, when the driver reports one
+    pub buffer_range: Option<(u32, u32)>,
+}
+
 pub struct AudioEngine {
-    _stream: Stream,
+    stream: Mutex<Option<Stream>>,
     ui: Mutex<UiState>,
     shared: Arc<Shared>,
     garbage: Mutex<HeapCons<Garbage>>,
-    device_name: String,
-    device_sample_rate: u32,
-    device_channels: usize,
-    device_sample_format: String,
+    device: Mutex<DeviceDesc>,
+    device_sample_rate: AtomicU32,
     /// Bumped on every montage rebuild so a slower, older rebuild can't overwrite a newer one
     montage_generation: AtomicU64,
     separating: AtomicBool,
@@ -376,32 +413,197 @@ pub struct AudioDeviceInfo {
     pub sample_rate: u32,
     pub channels: usize,
     pub sample_format: String,
+    /// Callback size in frames, when one was requested
+    pub buffer_frames: Option<u32>,
     pub latency_ms: f32,
     pub available_devices: Vec<String>,
 }
 
-// The cpal stream is only touched on construction and drop
+// The cpal stream is only touched while holding its mutex
 unsafe impl Send for AudioEngine {}
 unsafe impl Sync for AudioEngine {}
 
+const COMMON_RATES: [u32; 6] = [44100, 48000, 88200, 96000, 176400, 192000];
+
+/// Audio host APIs compiled in (WASAPI by default; ASIO with the `asio` feature)
+pub fn list_audio_hosts() -> Vec<String> {
+    cpal::available_hosts().into_iter().map(|id| id.name().to_string()).collect()
+}
+
+fn find_host(name: Option<&str>) -> Result<cpal::Host, String> {
+    match name {
+        None => Ok(cpal::default_host()),
+        Some(n) => {
+            let id = cpal::available_hosts()
+                .into_iter()
+                .find(|id| id.name().eq_ignore_ascii_case(n))
+                .ok_or_else(|| format!("Audio host '{}' is not available", n))?;
+            cpal::host_from_id(id).map_err(|e| format!("Could not open audio host '{}': {}", n, e))
+        }
+    }
+}
+
+/// Output devices of a host (default host when `None`)
+pub fn list_output_devices(host: Option<&str>) -> Vec<OutputDeviceInfo> {
+    let Ok(host) = find_host(host) else { return Vec::new() };
+    let Ok(devices) = host.output_devices() else { return Vec::new() };
+    devices
+        .filter_map(|d| {
+            let name = d.name().ok()?;
+            let default_sample_rate = d.default_output_config().map(|c| c.sample_rate().0).unwrap_or(48000);
+            let mut sample_rates = Vec::new();
+            let mut buffer_range = None;
+            if let Ok(configs) = d.supported_output_configs() {
+                for range in configs.filter(|r| r.channels() >= 2) {
+                    for &rate in &COMMON_RATES {
+                        if rate >= range.min_sample_rate().0 && rate <= range.max_sample_rate().0 && !sample_rates.contains(&rate) {
+                            sample_rates.push(rate);
+                        }
+                    }
+                    if let cpal::SupportedBufferSize::Range { min, max } = range.buffer_size() {
+                        buffer_range = Some((*min, *max));
+                    }
+                }
+            }
+            sample_rates.sort_unstable();
+            Some(OutputDeviceInfo { name, default_sample_rate, sample_rates, buffer_range })
+        })
+        .collect()
+}
+
+/// Pick the device and stream configuration for a choice
+fn resolve_output(choice: &DeviceChoice) -> Result<(cpal::Device, StreamConfig, SampleFormat, DeviceDesc), String> {
+    let host = find_host(choice.host.as_deref())?;
+    let device = match &choice.device {
+        None => host.default_output_device().ok_or("No default audio output device available")?,
+        Some(name) => host
+            .output_devices()
+            .map_err(|e| e.to_string())?
+            .find(|d| d.name().map(|n| &n == name).unwrap_or(false))
+            .ok_or_else(|| format!("Audio device '{}' not found", name))?,
+    };
+    let default = device
+        .default_output_config()
+        .map_err(|e| format!("Failed to query audio output config: {}", e))?;
+    let mut sample_format = default.sample_format();
+    let mut config: StreamConfig = default.into();
+
+    if let Some(rate) = choice.sample_rate {
+        // Find a supported range at this rate, preferring float output
+        let ranges: Vec<_> = device
+            .supported_output_configs()
+            .map_err(|e| e.to_string())?
+            .filter(|r| r.channels() >= 2 && rate >= r.min_sample_rate().0 && rate <= r.max_sample_rate().0)
+            .filter(|r| matches!(r.sample_format(), SampleFormat::F32 | SampleFormat::I16))
+            .collect();
+        let range = ranges
+            .iter()
+            .find(|r| r.sample_format() == SampleFormat::F32)
+            .or_else(|| ranges.first())
+            .ok_or_else(|| format!("The device does not support {} Hz", rate))?;
+        sample_format = range.sample_format();
+        config.channels = range.channels();
+        config.sample_rate = cpal::SampleRate(rate);
+    }
+    if let Some(frames) = choice.buffer_frames {
+        config.buffer_size = cpal::BufferSize::Fixed(frames);
+    }
+
+    let desc = DeviceDesc {
+        host: host.id().name().to_string(),
+        name: device.name().unwrap_or_else(|_| "Output".to_string()),
+        sample_rate: config.sample_rate.0,
+        channels: config.channels as usize,
+        sample_format: format!("{:?}", sample_format),
+        buffer_frames: choice.buffer_frames,
+    };
+    Ok((device, config, sample_format, desc))
+}
+
+fn new_rt_state(ui: &UiState, sr: f32, commands: HeapCons<Command>, garbage: HeapProd<Garbage>) -> RtState {
+    RtState {
+        suite: ui.suite.clone(),
+        buffer: ui.audio_buffer.clone(),
+        reference: ui.reference_buffer.clone(),
+        reference_gain: ui.reference_gain_offset,
+        mode: ui.mode,
+        trim_fade: ui.trim_fade,
+        plugin: ui.plugin.clone(),
+        stems: match (&ui.ml_stems, &ui.audio_buffer) {
+            (Some((src, stems)), Some(buf)) if Arc::ptr_eq(src, buf) => Some(Arc::clone(stems)),
+            _ => None,
+        },
+        stem_bus: StemBus::new(sr),
+        commands,
+        garbage,
+        dry_loudness: LoudnessFollower::new(sr, 3.0),
+        wet_loudness: LoudnessFollower::new(sr, 3.0),
+        ab_gain: 1.0,
+        frames_since_publish: 0,
+        in_l: vec![0.0; 8192],
+        in_r: vec![0.0; 8192],
+        out_l: vec![0.0; 8192],
+        out_r: vec![0.0; 8192],
+        device_f32: vec![0.0; 16384],
+    }
+}
+
+fn open_stream(device: &cpal::Device, config: &StreamConfig, sample_format: SampleFormat, shared: &Arc<Shared>, rt: RtState) -> Result<Stream, String> {
+    let channels = config.channels as usize;
+    let device_sample_rate = config.sample_rate.0;
+    let err_fn = |err| eprintln!("Audio stream error: {}", err);
+    // The callback closure owns `rt`; nothing else can reach it
+    let mut rt = rt;
+    let stream = match sample_format {
+        SampleFormat::F32 => {
+            let shared_cb = Arc::clone(shared);
+            device
+                .build_output_stream(
+                    config,
+                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                        AudioEngine::process_audio_f32(data, &mut rt, &shared_cb, channels, device_sample_rate);
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|e| format!("Failed to build F32 output stream: {}", e))?
+        }
+        SampleFormat::I16 => {
+            let shared_cb = Arc::clone(shared);
+            device
+                .build_output_stream(
+                    config,
+                    move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                        let mut f32_buf = std::mem::take(&mut rt.device_f32);
+                        if f32_buf.len() < data.len() {
+                            f32_buf.resize(data.len(), 0.0);
+                        }
+                        AudioEngine::process_audio_f32(&mut f32_buf[..data.len()], &mut rt, &shared_cb, channels, device_sample_rate);
+                        for (out, &s) in data.iter_mut().zip(f32_buf.iter()) {
+                            *out = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+                        }
+                        rt.device_f32 = f32_buf;
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|e| format!("Failed to build I16 output stream: {}", e))?
+        }
+        _ => return Err(format!("Unsupported audio sample format: {:?}", sample_format)),
+    };
+    stream.play().map_err(|e| format!("Failed to start audio stream: {}", e))?;
+    Ok(stream)
+}
+
 impl AudioEngine {
+    /// Open the default output device
     pub fn new() -> Result<Self, String> {
-        let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or_else(|| "No default audio output device available".to_string())?;
+        Self::with_device(&DeviceChoice::default())
+    }
 
-        let supported_config = device
-            .default_output_config()
-            .map_err(|e| format!("Failed to query default audio output config: {}", e))?;
-
-        let sample_format = supported_config.sample_format();
-        let device_sample_format = format!("{:?}", sample_format);
-        let device_name = device.name().unwrap_or_else(|_| "WASAPI Default Endpoint".to_string());
-        let config: StreamConfig = supported_config.into();
-        let device_sample_rate = config.sample_rate.0;
-        let channels = config.channels as usize;
-        let sr = device_sample_rate as f32;
+    pub fn with_device(choice: &DeviceChoice) -> Result<Self, String> {
+        let (device, config, sample_format, desc) = resolve_output(choice)?;
+        let sr = desc.sample_rate as f32;
 
         let (cmd_prod, cmd_cons) = HeapRb::<Command>::new(COMMAND_QUEUE).split();
         let (garbage_prod, garbage_cons) = HeapRb::<Garbage>::new(GARBAGE_QUEUE).split();
@@ -421,31 +623,8 @@ impl AudioEngine {
         });
 
         // Both copies start identical; afterwards every edit is applied to both
-        let suite = MasteringSuite::new(sr);
-        let rt = RtState {
-            suite: suite.clone(),
-            buffer: None,
-            reference: None,
-            reference_gain: 1.0,
-            mode: ProcessingMode::DspSuite,
-            trim_fade: TrimFadeSettings::default(),
-            plugin: None,
-            stems: None,
-            stem_bus: StemBus::new(sr),
-            commands: cmd_cons,
-            garbage: garbage_prod,
-            dry_loudness: LoudnessFollower::new(sr, 3.0),
-            wet_loudness: LoudnessFollower::new(sr, 3.0),
-            ab_gain: 1.0,
-            frames_since_publish: 0,
-            in_l: vec![0.0; 4096],
-            in_r: vec![0.0; 4096],
-            out_l: vec![0.0; 4096],
-            out_r: vec![0.0; 4096],
-            device_f32: vec![0.0; 8192],
-        };
         let ui = UiState {
-            suite,
+            suite: MasteringSuite::new(sr),
             audio_buffer: None,
             reference_buffer: None,
             reference_gain_offset: 1.0,
@@ -460,65 +639,85 @@ impl AudioEngine {
             commands: cmd_prod,
             commands_sent: 0,
         };
-
-        let err_fn = |err| eprintln!("Audio stream error: {}", err);
-        // The callback closure owns `rt`; nothing else can reach it
-        let mut rt = rt;
-        let stream = match sample_format {
-            SampleFormat::F32 => {
-                let shared_cb = Arc::clone(&shared);
-                device
-                    .build_output_stream(
-                        &config,
-                        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                            Self::process_audio_f32(data, &mut rt, &shared_cb, channels, device_sample_rate);
-                        },
-                        err_fn,
-                        None,
-                    )
-                    .map_err(|e| format!("Failed to build F32 output stream: {}", e))?
-            }
-            SampleFormat::I16 => {
-                let shared_cb = Arc::clone(&shared);
-                device
-                    .build_output_stream(
-                        &config,
-                        move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                            let mut f32_buf = std::mem::take(&mut rt.device_f32);
-                            if f32_buf.len() < data.len() {
-                                f32_buf.resize(data.len(), 0.0);
-                            }
-                            Self::process_audio_f32(&mut f32_buf[..data.len()], &mut rt, &shared_cb, channels, device_sample_rate);
-                            for (out, &s) in data.iter_mut().zip(f32_buf.iter()) {
-                                *out = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-                            }
-                            rt.device_f32 = f32_buf;
-                        },
-                        err_fn,
-                        None,
-                    )
-                    .map_err(|e| format!("Failed to build I16 output stream: {}", e))?
-            }
-            _ => return Err(format!("Unsupported audio sample format: {:?}", sample_format)),
-        };
-
-        stream
-            .play()
-            .map_err(|e| format!("Failed to start audio stream: {}", e))?;
+        let rt = new_rt_state(&ui, sr, cmd_cons, garbage_prod);
+        let stream = open_stream(&device, &config, sample_format, &shared, rt)?;
 
         Ok(Self {
-            _stream: stream,
+            stream: Mutex::new(Some(stream)),
             ui: Mutex::new(ui),
             shared,
             garbage: Mutex::new(garbage_cons),
-            device_name,
-            device_sample_rate,
-            device_channels: channels,
-            device_sample_format,
+            device_sample_rate: AtomicU32::new(desc.sample_rate),
+            device: Mutex::new(desc),
             montage_generation: AtomicU64::new(0),
             separating: AtomicBool::new(false),
             separation_progress: AtomicF32::default(),
         })
+    }
+
+    /// Switch to another host / device / sample rate / buffer size. Playback stops; the track,
+    /// suite settings, plugin and stems carry over. On failure the previous output is reopened.
+    pub fn reopen(&self, choice: &DeviceChoice) -> Result<(), String> {
+        let previous = {
+            let d = self.device.lock();
+            DeviceChoice {
+                host: Some(d.host.clone()),
+                device: Some(d.name.clone()),
+                sample_rate: Some(d.sample_rate),
+                buffer_frames: d.buffer_frames,
+            }
+        };
+        match self.reopen_inner(choice) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = self.reopen_inner(&previous).or_else(|_| self.reopen_inner(&DeviceChoice::default()));
+                Err(e)
+            }
+        }
+    }
+
+    fn reopen_inner(&self, choice: &DeviceChoice) -> Result<(), String> {
+        self.shared.playing.store(false, Ordering::Relaxed);
+        // Stop the old stream first; dropping it drops its callback state here, on this thread
+        drop(self.stream.lock().take());
+        self.collect_garbage();
+
+        let (device, config, sample_format, desc) = resolve_output(choice)?;
+        let sr = desc.sample_rate;
+
+        let (cmd_prod, cmd_cons) = HeapRb::<Command>::new(COMMAND_QUEUE).split();
+        let (garbage_prod, garbage_cons) = HeapRb::<Garbage>::new(GARBAGE_QUEUE).split();
+        let rt = {
+            let mut ui = self.ui.lock();
+            if ui.suite.sample_rate as u32 != sr {
+                ui.suite.set_sample_rate(sr as f32);
+            }
+            if let Some(ref p) = ui.plugin {
+                p.setup_audio(sr as f64, PLUGIN_MAX_BLOCK)?;
+            }
+            ui.commands = cmd_prod;
+            ui.commands_sent = 0;
+            self.shared.commands_applied.store(0, Ordering::Release);
+            new_rt_state(&ui, sr as f32, cmd_cons, garbage_prod)
+        };
+        *self.garbage.lock() = garbage_cons;
+
+        let stream = open_stream(&device, &config, sample_format, &self.shared, rt)?;
+        *self.stream.lock() = Some(stream);
+        self.device_sample_rate.store(sr, Ordering::Release);
+        *self.device.lock() = desc;
+        Ok(())
+    }
+
+    /// The output currently in use, as a choice that `reopen` accepts
+    pub fn current_device(&self) -> DeviceChoice {
+        let d = self.device.lock();
+        DeviceChoice {
+            host: Some(d.host.clone()),
+            device: Some(d.name.clone()),
+            sample_rate: Some(d.sample_rate),
+            buffer_frames: d.buffer_frames,
+        }
     }
 
     fn process_audio_f32(output: &mut [f32], rt: &mut RtState, shared: &Shared, num_device_channels: usize, device_sr: u32) {
@@ -724,7 +923,7 @@ impl AudioEngine {
     }
 
     pub fn device_sample_rate(&self) -> u32 {
-        self.device_sample_rate
+        self.device_sample_rate.load(Ordering::Acquire)
     }
 
     pub fn play(&self) {
@@ -1063,7 +1262,7 @@ impl AudioEngine {
     pub fn set_vst3_plugin(&self, plugin: Option<Vst3Plugin>) -> Result<(), String> {
         let plugin = match plugin {
             Some(p) => {
-                p.setup_audio(self.device_sample_rate as f64, PLUGIN_MAX_BLOCK)?;
+                p.setup_audio(self.device_sample_rate() as f64, PLUGIN_MAX_BLOCK)?;
                 Some(Arc::new(p))
             }
             None => None,
@@ -1092,7 +1291,7 @@ impl AudioEngine {
         if let Some(p) = plugin {
             let mut ui = self.ui.lock();
             if ui.plugin.as_ref().map(|cur| Arc::ptr_eq(cur, &p)).unwrap_or(false) {
-                let _ = p.setup_audio(self.device_sample_rate as f64, PLUGIN_MAX_BLOCK);
+                let _ = p.setup_audio(self.device_sample_rate() as f64, PLUGIN_MAX_BLOCK);
                 ui.send(Command::SetPlugin(Some(p)));
             }
         }
@@ -1151,7 +1350,7 @@ impl AudioEngine {
     pub fn learn_match_eq(&self) -> Result<(), String> {
         let source = self.audio_buffer().ok_or("Load a track first")?;
         let reference = self.reference_buffer().ok_or("Load a reference track first (+ Ref Track)")?;
-        let mut learned = MatchEq::new(self.device_sample_rate as f32);
+        let mut learned = MatchEq::new(self.device_sample_rate() as f32);
         learned.learn(&source, &reference)?;
         let (src_db, ref_db) = learned.learned_spectra();
         let (src_db, ref_db) = (src_db.to_vec(), ref_db.to_vec());
@@ -1165,9 +1364,24 @@ impl AudioEngine {
     /// Load and apply an XML preset (this app's own, or the element/param factory layout)
     pub fn load_xml_preset<P: AsRef<Path>>(&self, path: P) -> Result<XmlPreset, String> {
         let preset = XmlPreset::from_file(path)?;
-        let applied = preset.clone();
-        self.edit_dsp_suite(move |s| applied.apply_to_suite(s));
+        self.apply_preset(&preset);
         Ok(preset)
+    }
+
+    /// Every suite setting as a preset (for undo, snapshots and sessions)
+    pub fn suite_preset(&self) -> XmlPreset {
+        XmlPreset::from_suite(&self.ui.lock().suite, "state")
+    }
+
+    /// Apply a preset to the whole suite. The configured suite is built here and swapped in on
+    /// the audio thread, so nothing is parsed or allocated there.
+    pub fn apply_preset(&self, preset: &XmlPreset) {
+        let mut ui = self.ui.lock();
+        let mut next = ui.suite.clone();
+        preset.apply_to_suite(&mut next);
+        next.reset_state();
+        ui.suite = next.clone();
+        ui.send(Command::ReplaceSuite(Box::new(next)));
     }
 
     /// Access and configure the 6-channel Stem Mixer
@@ -1254,27 +1468,22 @@ impl AudioEngine {
         }
     }
 
-    /// Query WASAPI audio hardware details, device topology, and latency diagnostic metrics
+    /// The output in use and the other devices on its host
     pub fn get_device_info(&self) -> AudioDeviceInfo {
-        let host = cpal::default_host();
-        let available_devices = host.output_devices().map(|devices| {
-            devices.filter_map(|d| d.name().ok()).collect()
-        }).unwrap_or_default();
-
-        let latency_ms = if self.device_sample_rate > 0 {
-            (1024.0 / self.device_sample_rate as f32) * 1000.0
-        } else {
-            0.0
-        };
-
+        let d = self.device.lock().clone();
+        let available_devices = list_output_devices(Some(&d.host)).into_iter().map(|o| o.name).collect();
+        let frames = d.buffer_frames.unwrap_or(1024);
+        let latency_ms = if d.sample_rate > 0 { frames as f32 / d.sample_rate as f32 * 1000.0 } else { 0.0 };
         AudioDeviceInfo {
-            name: self.device_name.clone(),
-            host: "WASAPI (Windows Audio Session API Exclusive / Shared Low-Latency)".to_string(),
-            sample_rate: self.device_sample_rate,
-            channels: self.device_channels,
-            sample_format: self.device_sample_format.clone(),
+            name: d.name,
+            host: d.host,
+            sample_rate: d.sample_rate,
+            channels: d.channels,
+            sample_format: d.sample_format,
+            buffer_frames: d.buffer_frames,
             latency_ms,
             available_devices,
         }
     }
+
 }

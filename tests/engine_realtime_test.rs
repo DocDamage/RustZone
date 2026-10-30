@@ -1,6 +1,6 @@
 //! Engine tests that run against the real audio thread (need an output device)
 
-use mastering_studio::audio::{AudioBuffer, AudioEngine, ProcessingMode};
+use mastering_studio::audio::{list_audio_hosts, list_output_devices, AudioBuffer, AudioEngine, DeviceChoice, ProcessingMode};
 use mastering_studio::dsp::{calculate_buffer_integrated_lufs, MasteringSuite, Module, ModuleKind};
 use std::time::Duration;
 
@@ -91,4 +91,38 @@ fn test_auto_gain_cancels_a_modules_level_change() {
     let matched = render(true);
     assert!(boosted - dry > 2.0, "test EQ should be louder: {:.1} vs {:.1}", boosted, dry);
     assert!((matched - dry).abs() < 1.0, "auto gain left {:.1} dB difference", matched - dry);
+}
+
+#[test]
+fn test_reopen_switches_rate_and_keeps_settings() {
+    let Some(engine) = engine() else { return };
+    assert!(!list_audio_hosts().is_empty());
+    let host = engine.current_device().host;
+    let devices = list_output_devices(host.as_deref());
+    assert!(!devices.is_empty(), "no output devices listed");
+
+    engine.edit_dsp_suite(|s| s.maximizer.threshold_db = -7.0);
+    let n = 48000;
+    engine.set_audio_buffer(AudioBuffer::from_stereo(vec![0.1; n], vec![0.1; n], 48000));
+
+    let current = engine.current_device();
+    let device = devices.iter().find(|d| Some(&d.name) == current.device.as_ref()).unwrap_or(&devices[0]);
+    // Try another rate the device claims to support (shared-mode WASAPI may refuse; that's fine)
+    let other_rate = device.sample_rates.iter().copied().find(|&r| Some(r) != current.sample_rate);
+    let choice = DeviceChoice { sample_rate: other_rate, buffer_frames: Some(512), ..current.clone() };
+    match engine.reopen(&choice) {
+        Ok(()) => {
+            if let Some(rate) = other_rate {
+                assert_eq!(engine.device_sample_rate(), rate);
+            }
+        }
+        Err(e) => eprintln!("device refused {:?}: {} (fell back)", choice, e),
+    }
+    assert!(engine.flush_commands(), "audio thread not running after reopen");
+    engine.with_dsp_suite(|s| {
+        assert_eq!(s.maximizer.threshold_db, -7.0);
+        assert_eq!(s.sample_rate as u32, engine.device_sample_rate());
+    });
+    assert!(engine.audio_buffer().is_some());
+    engine.reopen(&current).expect("could not return to the original device");
 }

@@ -5,6 +5,10 @@ edition = "2021"
 authors = ["Mastering Studio"]
 description = "Standalone audio mastering suite in Rust"
 
+[features]
+# Steinberg ASIO output (needs the ASIO SDK: set CPAL_ASIO_DIR, plus LLVM for bindgen)
+asio = ["cpal/asio"]
+
 [dependencies]
 cpal = "0.15"
 hound = "3.5"
@@ -13,6 +17,11 @@ rfd = "0.15"
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
 ringbuf = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+eframe = { version = "=0.31.1", default-features = false, features = ["default_fonts", "glow"] }
+raw-window-handle = "0.6"
+png = "0.17"
 # ONNX Runtime for the bundled HTDemucs stem-separation model
 ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "download-binaries"] }
 

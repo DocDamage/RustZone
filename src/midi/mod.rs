@@ -1,79 +1,69 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+//! WinMM MIDI input. Every open input device delivers its Control Change and Note On messages
+//! as [`MidiEvent`]s on a channel; the UI decides what they control.
 
-// WinMM MIDI Type Definitions & Constants
+use crossbeam_channel::{Receiver, Sender};
+
 pub type HMIDIIN = isize;
-pub const CALLBACK_FUNCTION: u32 = 0x00030000;
-pub const MIM_DATA: u32 = 0x3C3;
-pub const MIM_OPEN: u32 = 0x3C1;
-pub const MIM_CLOSE: u32 = 0x3C2;
-
-pub const WM_APP_MIDI_CC: u32 = 0x8000 + 101;
-pub const WM_APP_MIDI_NOTE: u32 = 0x8000 + 102;
+const CALLBACK_FUNCTION: u32 = 0x00030000;
+const MIM_DATA: u32 = 0x3C3;
 
 #[link(name = "winmm")]
 extern "system" {
     fn midiInGetNumDevs() -> u32;
-    fn midiInOpen(
-        lphMidiIn: *mut HMIDIIN,
-        uDeviceID: u32,
-        dwCallback: usize,
-        dwInstance: usize,
-        dwFlags: u32,
-    ) -> u32;
+    fn midiInOpen(lphMidiIn: *mut HMIDIIN, uDeviceID: u32, dwCallback: usize, dwInstance: usize, dwFlags: u32) -> u32;
     fn midiInStart(hMidiIn: HMIDIIN) -> u32;
     fn midiInStop(hMidiIn: HMIDIIN) -> u32;
     fn midiInClose(hMidiIn: HMIDIIN) -> u32;
 }
 
-static mut TARGET_HWND: Option<HWND> = None;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MidiEvent {
+    /// `channel` is 0-15, `value` 0-127
+    ControlChange { channel: u8, controller: u8, value: u8 },
+    NoteOn { channel: u8, note: u8, velocity: u8 },
+}
 
-/// WinMM callback invoked by the Windows audio subsystem when incoming MIDI bytes arrive
-unsafe extern "system" fn midi_in_callback(
-    _h_midi_in: HMIDIIN,
-    w_msg: u32,
-    _dw_instance: usize,
-    dw_param1: usize,
-    _dw_param2: usize,
-) {
-    if w_msg == MIM_DATA {
-        let status = (dw_param1 & 0xFF) as u8;
-        let data1 = ((dw_param1 >> 8) & 0xFF) as u8;
-        let data2 = ((dw_param1 >> 16) & 0xFF) as u8;
+/// What the WinMM callback gets as its instance pointer
+struct MidiSink {
+    tx: Sender<MidiEvent>,
+    wake: Box<dyn Fn() + Send + Sync>,
+}
 
-        if let Some(hwnd) = TARGET_HWND {
-            let msg_type = status & 0xF0;
-            if msg_type == 0xB0 {
-                // Control Change (CC): WPARAM has (cc_num | (cc_val << 8)), LPARAM has status/channel
-                let wparam = WPARAM((data1 as usize) | ((data2 as usize) << 8));
-                let lparam = LPARAM(status as isize);
-                let _ = PostMessageW(hwnd, WM_APP_MIDI_CC, wparam, lparam);
-            } else if msg_type == 0x90 {
-                // Note On: data1 = note, data2 = velocity
-                if data2 > 0 {
-                    let wparam = WPARAM((data1 as usize) | ((data2 as usize) << 8));
-                    let lparam = LPARAM(status as isize);
-                    let _ = PostMessageW(hwnd, WM_APP_MIDI_NOTE, wparam, lparam);
-                }
-            }
-        }
+/// WinMM calls this on its own thread when MIDI bytes arrive
+unsafe extern "system" fn midi_in_callback(_h: HMIDIIN, w_msg: u32, dw_instance: usize, dw_param1: usize, _dw_param2: usize) {
+    if w_msg != MIM_DATA || dw_instance == 0 {
+        return;
+    }
+    let sink = &*(dw_instance as *const MidiSink);
+    let status = (dw_param1 & 0xFF) as u8;
+    let data1 = ((dw_param1 >> 8) & 0x7F) as u8;
+    let data2 = ((dw_param1 >> 16) & 0x7F) as u8;
+    let channel = status & 0x0F;
+    let event = match status & 0xF0 {
+        0xB0 => Some(MidiEvent::ControlChange { channel, controller: data1, value: data2 }),
+        0x90 if data2 > 0 => Some(MidiEvent::NoteOn { channel, note: data1, velocity: data2 }),
+        _ => None,
+    };
+    if let Some(e) = event {
+        let _ = sink.tx.send(e);
+        (sink.wake)();
     }
 }
 
-/// Hardware MIDI Controller Receiver
+/// Listens to every MIDI input device for as long as it lives
 pub struct MidiController {
     handles: Vec<HMIDIIN>,
-    is_active: Arc<AtomicBool>,
+    sink: *mut MidiSink,
 }
 
-impl MidiController {
-    pub fn new(target_hwnd: HWND) -> Self {
-        unsafe {
-            TARGET_HWND = Some(target_hwnd);
-        }
+// The sink is only freed in Drop, after every device is closed
+unsafe impl Send for MidiController {}
 
+impl MidiController {
+    /// Open all inputs. `wake` is called after each event (e.g. to repaint the UI).
+    pub fn open(wake: impl Fn() + Send + Sync + 'static) -> (Self, Receiver<MidiEvent>) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let sink = Box::into_raw(Box::new(MidiSink { tx, wake: Box::new(wake) }));
         let mut handles = Vec::new();
         let num_devs = unsafe { midiInGetNumDevs() };
         println!("Hardware MIDI Subsystem: Detected {} MIDI Input Device(s)", num_devs);
@@ -81,30 +71,17 @@ impl MidiController {
         for dev_id in 0..num_devs {
             let mut handle: HMIDIIN = 0;
             let res = unsafe {
-                midiInOpen(
-                    &mut handle as *mut _,
-                    dev_id,
-                    midi_in_callback as *const () as usize,
-                    0,
-                    CALLBACK_FUNCTION,
-                )
+                midiInOpen(&mut handle, dev_id, midi_in_callback as *const () as usize, sink as usize, CALLBACK_FUNCTION)
             };
-
             if res == 0 && handle != 0 {
-                let start_res = unsafe { midiInStart(handle) };
-                if start_res == 0 {
-                    println!("   -> Connected and listening to MIDI Device #{}: Handle {:x}", dev_id, handle);
+                if unsafe { midiInStart(handle) } == 0 {
                     handles.push(handle);
                 } else {
                     unsafe { midiInClose(handle) };
                 }
             }
         }
-
-        Self {
-            handles,
-            is_active: Arc::new(AtomicBool::new(true)),
-        }
+        (Self { handles, sink }, rx)
     }
 
     pub fn device_count(&self) -> usize {
@@ -114,7 +91,6 @@ impl MidiController {
 
 impl Drop for MidiController {
     fn drop(&mut self) {
-        self.is_active.store(false, Ordering::Relaxed);
         for &handle in &self.handles {
             unsafe {
                 let _ = midiInStop(handle);
@@ -122,8 +98,7 @@ impl Drop for MidiController {
             }
         }
         self.handles.clear();
-        unsafe {
-            TARGET_HWND = None;
-        }
+        // No callback can run once every device is closed
+        unsafe { drop(Box::from_raw(self.sink)) };
     }
 }
