@@ -19,6 +19,8 @@ struct ViewModel {
     status: Option<String>,
     meters: [f32; 4],
     latency: usize,
+    /// Spectral modules running in a shared STFT pass
+    shared_spectral: usize,
     sample_rate: f32,
     eq: Option<crate::dsp::DynamicEqualizer>,
 }
@@ -37,6 +39,7 @@ pub fn show(app: &mut MasteringApp, ui: &mut egui::Ui, meters: &MeterLevels) {
             status: m.status(),
             meters: m.meters(),
             latency: s.latency_samples(),
+            shared_spectral: s.shared_spectral_modules(),
             sample_rate: s.sample_rate,
             eq: (selected == ModuleKind::Equalizer).then(|| s.dynamic_eq.clone()),
         }
@@ -86,6 +89,10 @@ fn chain_list(app: &mut MasteringApp, ui: &mut egui::Ui, vm: &ViewModel) {
         ui.add_space(8.0);
         let ms = vm.latency as f32 / vm.sample_rate.max(1.0) * 1000.0;
         ui.label(RichText::new(format!("Chain latency: {} samples ({:.1} ms)", vm.latency, ms)).color(DIM).size(11.0));
+        if vm.shared_spectral > 0 {
+            ui.label(RichText::new(format!("{} spectral modules share one FFT pass", vm.shared_spectral)).color(DIM).size(11.0))
+                .on_hover_text("Neighbouring spectral modules (with only switched-off modules between them) are analysed once, saving CPU and 2048 samples of latency per module. Auto gain-match keeps a module on its own.");
+        }
     });
 }
 

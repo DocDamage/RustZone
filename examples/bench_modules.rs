@@ -4,6 +4,8 @@
 
 use std::time::Instant;
 
+use mastering_studio::audio::{AudioBuffer, StyleFrontEnd, StyleModel};
+use mastering_studio::dsp::style_match::{prepare_excerpts, render_candidate};
 use mastering_studio::dsp::{MasteringSuite, ModuleKind};
 
 const SR: f32 = 48000.0;
@@ -56,6 +58,29 @@ fn row(name: &str, load: f64) {
     println!("{:<34} {:>7.2}% of a core   {:>8.0}x real time", name, load * 100.0, 1.0 / load.max(1e-9));
 }
 
+/// Time one Match reference (AI) candidate: its excerpts through the default chain and, when the
+/// model is present, the embeddings
+fn style_eval(input: &(Vec<f32>, Vec<f32>)) {
+    let track = AudioBuffer::from_stereo(input.0.clone(), input.1.clone(), SR as u32);
+    let mut suite = MasteringSuite::new(SR);
+    let latency = suite.latency_samples();
+    let excerpts = prepare_excerpts(&track, None, &suite, latency);
+    let front_end = StyleFrontEnd::default();
+    let started = Instant::now();
+    let features = render_candidate(&mut suite, &excerpts, &front_end).expect("render failed");
+    let render = started.elapsed().as_secs_f64();
+    let model = mastering_studio::audio::ml_style::find_model().map(|p| StyleModel::load(&p).expect("model failed to load"));
+    match model {
+        Some(mut model) => {
+            let started = Instant::now();
+            model.embed_features(&features).expect("embed failed");
+            let embed = started.elapsed().as_secs_f64();
+            println!("{:<34} {:>7.0} ms render + {:.0} ms embed ({} excerpts)", "style_eval", render * 1e3, embed * 1e3, excerpts.len());
+        }
+        None => println!("{:<34} {:>7.0} ms render, no model to embed ({} excerpts)", "style_eval", render * 1e3, excerpts.len()),
+    }
+}
+
 fn main() {
     if cfg!(debug_assertions) {
         eprintln!("Note: this is a debug build; use --release for meaningful numbers");
@@ -77,4 +102,6 @@ fn main() {
         all.module_mut(k).set_enabled(true);
     }
     row("Every module on", measure(&mut all, &input));
+    println!();
+    style_eval(&input);
 }

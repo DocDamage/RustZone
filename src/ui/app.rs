@@ -14,10 +14,16 @@ use super::plugin_window::PluginWindow;
 use super::widgets::{self, WaveformAction, ACCENT, DIM, WARN};
 use super::{discover_vst3_plugins, save_png, LaunchOptions, AUDIO_EXTENSIONS, EXPORT_FORMATS, TARGETS};
 use crate::audio::{
-    list_audio_hosts, list_output_devices, load_audio_file, render_to_wav, AudioEngine, BwfMetadata, DeviceChoice,
-    FadeShape, OutputDeviceInfo, ProcessingMode, RenderOptions, RenderSource,
+    list_audio_hosts, list_output_devices, load_audio_file, render_to_buffer, render_to_file, AudioBuffer, AudioEngine, BwfMetadata,
+    CodecPreview, DeviceChoice, FadeShape, OutputDeviceInfo, PreviewMode, ProcessingMode, QcReport, QcTargets, RenderOptions,
+    RenderSource, StyleModel, TextModel,
 };
-use crate::dsp::{calculate_buffer_integrated_lufs, MasteringSuite, ModuleKind, XmlPreset};
+use crate::dsp::style_match::CANCELLED;
+use crate::dsp::text_edit::MAX_TOKENS;
+use crate::dsp::{
+    calculate_buffer_integrated_lufs, match_to_reference, plan_request, MasterAssistantReport, MasteringSuite, MatchOptions, MatchResult,
+    ModuleKind, TextPlan, XmlPreset, GENRES,
+};
 use crate::midi::{MidiController, MidiEvent};
 use crate::session::{History, Session, SessionUiState, Snapshots, SESSION_EXTENSION, SLOT_NAMES};
 use crate::vst3::Vst3Plugin;
@@ -55,6 +61,9 @@ impl Status {
     }
 }
 
+type StyleOutcome = (Arc<AudioBuffer>, Result<MatchResult, String>);
+type TextOutcome = (Arc<AudioBuffer>, Result<TextPlan, String>);
+
 /// Device dialog state
 pub(super) struct DeviceDialog {
     open: bool,
@@ -88,6 +97,34 @@ pub struct MasteringApp {
     pub(super) midi_learn: Option<MidiTarget>,
     device_dialog: DeviceDialog,
     assistant_report: Option<String>,
+    /// Genre profile the Assistant aims for (index into `GENRES`)
+    genre: usize,
+    /// Aim for the loaded reference track instead of the genre
+    assistant_uses_reference: bool,
+    /// Finished Assistant analysis, waiting to be applied on the UI thread
+    assistant_result: Arc<Mutex<Option<Result<MasterAssistantReport, String>>>>,
+    /// Whether the style model was found at startup
+    style_model_found: bool,
+    /// Match reference (AI) leaves switched-off modules alone
+    style_only_enabled: bool,
+    style_matching: Arc<AtomicBool>,
+    style_cancel: Arc<AtomicBool>,
+    /// Finished reference match and the track it was made for, waiting for the UI thread
+    style_result: Arc<Mutex<Option<StyleOutcome>>>,
+    style_report: Option<String>,
+    /// What the user typed for the text model
+    text_request: String,
+    text_model_found: Arc<AtomicBool>,
+    /// A text-model download or request is running
+    text_running: Arc<AtomicBool>,
+    text_cancel: Arc<AtomicBool>,
+    /// Finished text request and the track it was made for, waiting for the UI thread
+    text_result: Arc<Mutex<Option<TextOutcome>>>,
+    text_report: Option<String>,
+    /// Latest export QC report, set by the export job
+    pub(super) qc_report: Arc<Mutex<Option<String>>>,
+    /// Chain settings the loaded codec preview was rendered with (to flag it as out of date)
+    preview_fingerprint: Option<String>,
     screenshot: Option<(PathBuf, u32)>,
     started: Instant,
 }
@@ -143,6 +180,23 @@ impl MasteringApp {
             midi_map: HashMap::new(),
             midi_learn: None,
             assistant_report: None,
+            genre: 0,
+            assistant_uses_reference: true,
+            assistant_result: Arc::new(Mutex::new(None)),
+            style_model_found: crate::audio::ml_style::find_model().is_some(),
+            style_only_enabled: true,
+            style_matching: Arc::new(AtomicBool::new(false)),
+            style_cancel: Arc::new(AtomicBool::new(false)),
+            style_result: Arc::new(Mutex::new(None)),
+            style_report: None,
+            text_request: String::new(),
+            text_model_found: Arc::new(AtomicBool::new(crate::audio::ml_text::find_model().is_some())),
+            text_running: Arc::new(AtomicBool::new(false)),
+            text_cancel: Arc::new(AtomicBool::new(false)),
+            text_result: Arc::new(Mutex::new(None)),
+            text_report: None,
+            qc_report: Arc::new(Mutex::new(None)),
+            preview_fingerprint: None,
             screenshot: options.screenshot.map(|p| (p, 0)),
             started: Instant::now(),
         };
@@ -264,7 +318,7 @@ impl MasteringApp {
         else {
             return;
         };
-        let ui = SessionUiState { export_format: self.export_format, loudness_target: self.target };
+        let ui = SessionUiState { export_format: self.export_format, loudness_target: self.target, assistant_genre: self.genre };
         let session = Session::capture(&self.engine, &self.snapshots, self.track_path.as_deref(), self.reference_path.as_deref(), ui);
         match session.save(&path) {
             Ok(()) => self.status.set(format!("Session saved: {}", path.display())),
@@ -288,6 +342,7 @@ impl MasteringApp {
                 self.reference_path = session.reference.clone().filter(|p| p.exists());
                 self.export_format = ui.export_format.min(EXPORT_FORMATS.len() - 1);
                 self.target = ui.loudness_target.min(TARGETS.len() - 1);
+                self.genre = ui.assistant_genre.min(GENRES.len() - 1);
                 self.history.clear();
                 self.view = View::Suite;
                 if warnings.is_empty() {
@@ -431,21 +486,164 @@ impl MasteringApp {
         }
     }
 
+    /// Analyse the track in the background; `apply_assistant_result` sets the suite up when done
     fn run_assistant(&mut self) {
-        let before = self.engine.suite_preset();
-        match self.engine.run_master_assistant(TARGETS[self.target].target_lufs) {
+        if self.engine.audio_buffer().is_none() {
+            self.status.set("Assistant: load a track first");
+            return;
+        }
+        let t = TARGETS[self.target];
+        let (genre, use_reference) = (self.genre, self.assistant_uses_reference);
+        let out = Arc::clone(&self.assistant_result);
+        let ctx = self.ctx.clone();
+        self.spawn_job(move |engine, status| {
+            let against = if use_reference && engine.reference_buffer().is_some() { "the reference track".to_string() } else { GENRES[genre].name.to_string() };
+            status.set(format!("Assistant: analysing the track against {}…", against));
+            ctx.request_repaint();
+            *out.lock() = Some(engine.analyze_for_assistant(t.target_lufs, t.ceiling_dbtp, genre, use_reference));
+            status.set("Assistant: done");
+        });
+    }
+
+    fn apply_assistant_result(&mut self) {
+        let Some(result) = self.assistant_result.lock().take() else { return };
+        match result {
             Ok(r) => {
+                let before = self.engine.suite_preset();
+                self.engine.apply_assistant(&r);
                 self.history.record(before, "assistant");
                 self.history.break_coalescing();
-                let eq: String = r.recommended_eq_adjustments.iter().map(|l| format!("  • {}\n", l)).collect();
-                self.assistant_report = Some(format!(
-                    "Track profile\n  • Integrated {:.1} LUFS (target {:.1})\n  • Peak {:.1} dBTP, RMS {:.1} dB, crest {:.1} dB\n  • Sub-bass phase correlation {:+.2}\n\nApplied\n  • Maximizer threshold {:.1} dB, ceiling {:.1} dBTP\n  • Stereo width {:.0}%, mono below {:.0} Hz\n\nEQ moves\n{}",
-                    r.current_integrated_lufs, r.target_integrated_lufs, r.peak_level_dbtp, r.rms_level_db, r.crest_factor_db,
-                    r.sub_bass_phase_corr, r.recommended_threshold_db, r.recommended_ceiling_db, r.recommended_stereo_width * 100.0,
-                    r.recommended_mono_maker_hz, eq
-                ));
+                self.status.set(format!("Assistant set up the suite for {}", r.target_name));
+                self.assistant_report = Some(r.to_text());
             }
             Err(e) => self.status.set(format!("Assistant: {}", e)),
+        }
+    }
+
+    /// Search for the settings that bring the track closest to the reference, in the background;
+    /// `apply_style_match` sets the suite when it's done
+    fn run_style_match(&mut self) {
+        let (Some(track), Some(reference)) = (self.engine.audio_buffer(), self.engine.reference_buffer()) else {
+            self.status.set("Match reference: load a track and a reference first");
+            return;
+        };
+        let cancel = Arc::clone(&self.style_cancel);
+        let options = MatchOptions {
+            only_enabled: self.style_only_enabled,
+            ceiling_db: Some(TARGETS[self.target].ceiling_dbtp),
+            cancel: Some(Arc::clone(&cancel)),
+            ..Default::default()
+        };
+        let matching = Arc::clone(&self.style_matching);
+        let out = Arc::clone(&self.style_result);
+        let ctx = self.ctx.clone();
+        self.spawn_job(move |engine, status| {
+            matching.store(true, Ordering::Release);
+            cancel.store(false, Ordering::Release);
+            status.set("Matching reference: loading the style model…");
+            ctx.request_repaint();
+            let suite = engine.dsp_suite_snapshot();
+            let stems = engine.ml_stems();
+            let result = StyleModel::load_default().and_then(|mut model| {
+                match_to_reference(&track, &reference, &suite, &mut model, stems.as_deref(), &options, |p| {
+                    status.set(format!("Matching reference: gen {}/{}, {:.0}% closer", p.generation, p.generations, p.closer_percent));
+                    ctx.request_repaint();
+                })
+            });
+            *out.lock() = Some((track, result));
+            matching.store(false, Ordering::Release);
+        });
+    }
+
+    fn apply_style_match(&mut self) {
+        let Some((track, result)) = self.style_result.lock().take() else { return };
+        let same_track = self.engine.audio_buffer().is_some_and(|b| Arc::ptr_eq(&b, &track));
+        match result {
+            Ok(_) if !same_track => self.status.set("Match reference: the track changed, so the result was dropped"),
+            Ok(r) if r.improved() => {
+                let (space, best) = (r.space.clone(), r.best.clone());
+                self.history.break_coalescing();
+                self.edit_suite("style_match", move |s| space.decode(&best, s));
+                self.history.break_coalescing();
+                self.status.set(format!("Matched the reference: {:.0}% closer. Ctrl+Z undoes it", r.improvement_percent()));
+                self.style_report = Some(r.to_text());
+            }
+            Ok(_) => self.status.set("Match reference: the current settings were already the closest found"),
+            Err(e) if e == CANCELLED => self.status.set("Match reference cancelled; nothing changed"),
+            Err(e) => self.status.set(format!("Match reference: {}", e)),
+        }
+    }
+
+    /// Fetch the text model in the background
+    fn download_text_model(&mut self) {
+        let running = Arc::clone(&self.text_running);
+        let cancel = Arc::clone(&self.text_cancel);
+        let found = Arc::clone(&self.text_model_found);
+        let ctx = self.ctx.clone();
+        self.spawn_job(move |_, status| {
+            running.store(true, Ordering::Release);
+            cancel.store(false, Ordering::Release);
+            let result = crate::audio::ml_text::download_model(&cancel, |p| {
+                status.set(format!("Downloading the text model: {:.0}%", p * 100.0));
+                ctx.request_repaint();
+            });
+            match result {
+                Ok(_) => {
+                    found.store(true, Ordering::Release);
+                    status.set("Text model ready");
+                }
+                Err(e) if e == CANCELLED => status.set("Text model download cancelled"),
+                Err(e) => status.set(format!("Text model: {}", e)),
+            }
+            running.store(false, Ordering::Release);
+        });
+    }
+
+    /// Ask the text model for small moves in the background; `apply_text_request` makes them
+    fn run_text_request(&mut self) {
+        let Some(track) = self.engine.audio_buffer() else {
+            self.status.set("Load a track first");
+            return;
+        };
+        let request = self.text_request.clone();
+        let target_lufs = TARGETS[self.target].target_lufs;
+        let running = Arc::clone(&self.text_running);
+        let cancel = Arc::clone(&self.text_cancel);
+        let out = Arc::clone(&self.text_result);
+        let ctx = self.ctx.clone();
+        self.spawn_job(move |engine, status| {
+            running.store(true, Ordering::Release);
+            cancel.store(false, Ordering::Release);
+            status.set("Text request: loading the model…");
+            ctx.request_repaint();
+            let suite = engine.dsp_suite_snapshot();
+            let result = TextModel::load_default().and_then(|model| {
+                plan_request(&track, &suite, &request, target_lufs, |chat, grammar| {
+                    status.set("Text request: thinking…");
+                    ctx.request_repaint();
+                    model.generate(chat, grammar, MAX_TOKENS, &cancel)
+                })
+            });
+            *out.lock() = Some((track, result));
+            running.store(false, Ordering::Release);
+        });
+    }
+
+    fn apply_text_request(&mut self) {
+        let Some((track, result)) = self.text_result.lock().take() else { return };
+        let same_track = self.engine.audio_buffer().is_some_and(|b| Arc::ptr_eq(&b, &track));
+        match result {
+            Ok(_) if !same_track => self.status.set("Text request: the track changed, so the result was dropped"),
+            Ok(plan) if plan.edits.is_empty() => self.status.set("Text request: the model suggested no change"),
+            Ok(plan) => {
+                self.text_report = Some(plan.to_text());
+                self.status.set("Text request applied. Ctrl+Z undoes it");
+                self.history.break_coalescing();
+                self.edit_suite("text_request", move |s| plan.apply(s));
+                self.history.break_coalescing();
+            }
+            Err(e) if e == CANCELLED => self.status.set("Text request cancelled; nothing changed"),
+            Err(e) => self.status.set(format!("Text request: {}", e)),
         }
     }
 
@@ -476,17 +674,21 @@ impl MasteringApp {
             return;
         };
         let format = EXPORT_FORMATS[self.export_format];
+        let (filter, ext) = format.filter();
         let Some(path) = rfd::FileDialog::new()
             .set_title(format!("Export master ({})", format.name))
-            .set_file_name("master.wav")
-            .add_filter("WAV", &["wav"])
+            .set_file_name(format!("master.{}", ext))
+            .add_filter(filter, &[ext])
             .save_file()
         else {
             return;
         };
+        let path = format.codec.with_extension(&path);
         self.engine.pause();
         let mode = self.engine.processing_mode();
         let ctx = self.ctx.clone();
+        let targets = self.qc_targets();
+        let qc_out = Arc::clone(&self.qc_report);
         self.spawn_job(move |engine, status| {
             let trim = engine.trim_fade();
             let stems = engine.ml_stems();
@@ -498,16 +700,117 @@ impl MasteringApp {
                     stems: stems.clone(),
                     ..Default::default()
                 };
-                render_to_wav(&buf, &path, format.bit_depth, source, Some(opts), None, |p| {
+                render_to_file(&buf, &path, format.codec, source, Some(opts), None, |p| {
                     status.set(format!("Rendering master: {:.0}%", p * 100.0));
                     ctx.request_repaint();
                 })
             });
             match res {
-                Ok(()) => status.set(format!("Exported {}", path.display())),
+                Ok(()) => {
+                    status.set("Exported; checking the file…");
+                    ctx.request_repaint();
+                    match check_export(&path, format.name, targets) {
+                        Ok(report) => {
+                            status.set(format!("Exported {}: {}", path.display(), report.summary()));
+                            *qc_out.lock() = Some(report.to_text());
+                        }
+                        Err(e) => status.set(format!("Exported {} ({})", path.display(), e)),
+                    }
+                }
                 Err(e) => status.set(format!("Export failed: {}", e)),
             }
         });
+    }
+
+    /// Render the master, encode it with the selected lossy export format and load the decoded
+    /// result for playback
+    fn build_codec_preview(&mut self) {
+        let Some(buf) = self.engine.audio_buffer() else {
+            self.status.set("Load a track to preview a codec");
+            return;
+        };
+        let format = EXPORT_FORMATS[self.export_format];
+        if !format.codec.is_lossy() {
+            self.status.set("Pick an MP3 or AAC export format to preview what the codec does");
+            return;
+        }
+        let mode = self.engine.processing_mode();
+        self.preview_fingerprint = Some(self.chain_fingerprint());
+        let ctx = self.ctx.clone();
+        self.spawn_job(move |engine, status| {
+            let stems = engine.ml_stems();
+            // Full length and without fades: playback applies trim and fades to the preview too
+            let master = with_render_source(engine, mode, |source| {
+                let opts = RenderOptions { stems, ..Default::default() };
+                render_to_buffer(&buf, source, Some(opts), None, |p| {
+                    status.set(format!("Codec preview: rendering the master {:.0}%", p * 100.0));
+                    ctx.request_repaint();
+                })
+            });
+            status.set(format!("Codec preview: encoding {}…", format.name));
+            ctx.request_repaint();
+            match master.and_then(|m| CodecPreview::build(&m, format.codec, |_| ctx.request_repaint())) {
+                Ok(preview) => {
+                    status.set(format!("Codec preview ready (P cycles master / codec / difference). {}", preview.summary()));
+                    engine.set_codec_preview(Some(preview));
+                    engine.set_preview_mode(PreviewMode::Codec);
+                }
+                Err(e) => status.set(format!("Codec preview: {}", e)),
+            }
+        });
+    }
+
+    /// Everything a codec preview depends on, to tell when it no longer matches the chain
+    fn chain_fingerprint(&self) -> String {
+        format!("{:?}{}", self.engine.processing_mode(), self.engine.suite_preset().to_xml_string())
+    }
+
+    fn cycle_preview(&mut self) {
+        if self.engine.codec_preview().is_some() {
+            self.engine.set_preview_mode(self.engine.preview_mode().next());
+        } else if !self.busy.load(Ordering::Relaxed) {
+            self.build_codec_preview();
+        }
+    }
+
+    fn preview_controls(&mut self, ui: &mut egui::Ui, busy: bool) {
+        let lossy = EXPORT_FORMATS[self.export_format].codec.is_lossy();
+        let preview = self.engine.codec_preview();
+        let label = if preview.is_some() { "Re-render preview" } else { "Codec preview" };
+        if ui
+            .add_enabled(!busy && lossy, egui::Button::new(label))
+            .on_hover_text("Hear the master after MP3 / AAC encoding with the selected export format (P)")
+            .on_disabled_hover_text("Pick an MP3 or AAC export format to preview what the codec does")
+            .clicked()
+        {
+            self.build_codec_preview();
+        }
+        let Some(preview) = preview else { return };
+        let mode = self.engine.preview_mode();
+        let codec = match preview.codec {
+            crate::audio::ExportCodec::Mp3(k) => format!("MP3 {}", k),
+            crate::audio::ExportCodec::Aac(k) => format!("AAC {}", k),
+            other => other.name().to_string(),
+        };
+        for (m, text, hint) in [
+            (PreviewMode::Off, "Master".to_string(), "The live chain"),
+            (PreviewMode::Codec, codec, "The master after encoding and decoding"),
+            (PreviewMode::Difference, "Difference".to_string(), "Master minus codec: what the encoder throws away"),
+        ] {
+            if ui.selectable_label(mode == m, text).on_hover_text(hint).clicked() {
+                self.engine.set_preview_mode(m);
+            }
+        }
+        if self.preview_fingerprint.as_deref() != Some(self.chain_fingerprint().as_str()) {
+            ui.label(RichText::new("settings changed: re-render").color(WARN).size(11.0))
+                .on_hover_text("The preview was rendered with earlier settings");
+        }
+    }
+
+    /// Loudness target and ceiling the QC report judges against
+    pub(super) fn qc_targets(&self) -> QcTargets {
+        let t = TARGETS[self.target];
+        QcTargets { target_lufs: Some(t.target_lufs), ceiling_dbtp: Some(t.ceiling_dbtp) }
     }
 
     fn batch(&mut self) {
@@ -527,25 +830,31 @@ impl MasteringApp {
         let mode = self.engine.processing_mode();
         let format = EXPORT_FORMATS[self.export_format];
         let out_dir = folder.join("Mastered");
+        let targets = self.qc_targets();
         self.spawn_job(move |engine, status| {
             let _ = std::fs::create_dir_all(&out_dir);
             let total = files.len();
             let mut done = 0;
+            let mut flagged = 0;
             for (i, file) in files.iter().enumerate() {
                 let stem = file.file_stem().unwrap_or_default().to_string_lossy().to_string();
                 status.set(format!("Batch {}/{}: {}", i + 1, total, stem));
                 if let Ok(buf) = load_audio_file(file) {
-                    let out = out_dir.join(format!("{}_master.wav", stem));
+                    let out = out_dir.join(format!("{}_master.{}", stem, format.codec.extension()));
                     let res = with_render_source(engine, mode, |source| {
                         let opts = RenderOptions { bwf_metadata: Some(BwfMetadata::default()), target_sample_rate: format.sample_rate, ..Default::default() };
-                        render_to_wav(&buf, &out, format.bit_depth, source, Some(opts), None, |_| {})
+                        render_to_file(&buf, &out, format.codec, source, Some(opts), None, |_| {})
                     });
                     if res.is_ok() {
                         done += 1;
+                        if check_export(&out, format.name, targets).map_or(true, |r| r.overall() != crate::audio::QcStatus::Pass) {
+                            flagged += 1;
+                        }
                     }
                 }
             }
-            status.set(format!("Batch done: {}/{} files in {}", done, total, out_dir.display()));
+            let qc = if flagged > 0 { format!(", {} flagged by QC (see the .qc.txt reports)", flagged) } else { ", all passed QC".to_string() };
+            status.set(format!("Batch done: {}/{} files in {}{}", done, total, out_dir.display(), if done > 0 { qc } else { String::new() }));
         });
     }
 
@@ -626,6 +935,7 @@ impl MasteringApp {
                 }
                 (Key::D, false) => self.export_format = (self.export_format + 1) % EXPORT_FORMATS.len(),
                 (Key::H, false) => self.open_device_dialog(),
+                (Key::P, false) => self.cycle_preview(),
                 (Key::OpenBracket, false) => self.set_trim_here(true),
                 (Key::CloseBracket, false) => self.set_trim_here(false),
                 (Key::F, false) => self.cycle_fades(),
@@ -886,6 +1196,7 @@ impl MasteringApp {
                 })
                 .response
                 .on_hover_text("Export format (D)");
+            self.preview_controls(ui, busy);
         });
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Processor").color(DIM));
@@ -945,14 +1256,103 @@ impl MasteringApp {
                     Err(e) => self.status.set(e),
                 }
             }
+            if self.style_matching.load(Ordering::Acquire) {
+                if ui.button("Cancel match").clicked() {
+                    self.style_cancel.store(true, Ordering::Release);
+                }
+            } else {
+                let blocker = self.style_match_blocker(has_ref);
+                let button = egui::Button::new("Match reference (AI)");
+                let mut resp = ui
+                    .add_enabled(!busy && blocker.is_none(), button)
+                    .on_hover_text("Search for suite settings that make the track sound like the reference. Takes a minute or two; Ctrl+Z undoes it");
+                if let Some(why) = blocker {
+                    resp = resp.on_disabled_hover_text(why);
+                }
+                if resp.clicked() {
+                    self.run_style_match();
+                }
+            }
+            ui.checkbox(&mut self.style_only_enabled, "Only adjust enabled modules")
+                .on_hover_text("When off, Match reference (AI) may switch modules on");
             ui.separator();
-            if ui.button("Assistant").on_hover_text("Analyse the track and set up the suite (A)").clicked() {
+            if ui.add_enabled(!busy, egui::Button::new("Assistant")).on_hover_text("Analyse the track and set up the suite (A)").clicked() {
                 self.run_assistant();
             }
+            let has_reference = self.engine.reference_buffer().is_some();
+            let by_reference = has_reference && self.assistant_uses_reference;
+            ui.add_enabled_ui(!by_reference, |ui| {
+                egui::ComboBox::from_id_salt("genre")
+                    .selected_text(GENRES[self.genre].name)
+                    .width(150.0)
+                    .show_ui(ui, |ui| {
+                        for (i, g) in GENRES.iter().enumerate() {
+                            ui.selectable_value(&mut self.genre, i, g.name);
+                        }
+                    })
+                    .response
+                    .on_hover_text("Genre the Assistant aims for: tonal balance, dynamics and width of a typical master")
+                    .on_disabled_hover_text("The Assistant is aiming for the reference track");
+            });
+            ui.add_enabled(has_reference, egui::Checkbox::new(&mut self.assistant_uses_reference, "Match reference"))
+                .on_hover_text("Aim for the reference track's tone (Match EQ), dynamics and width instead of the genre")
+                .on_disabled_hover_text("Load a reference track to aim for it");
             if ui.button("Audio device…").on_hover_text("H").clicked() {
                 self.open_device_dialog();
             }
         });
+        ui.horizontal_wrapped(|ui| self.text_request_row(ui, busy));
+    }
+
+    fn text_request_row(&mut self, ui: &mut egui::Ui, busy: bool) {
+        ui.label(RichText::new("Describe").color(DIM));
+        let field = egui::TextEdit::singleline(&mut self.text_request).hint_text("warmer, less harsh, wider").desired_width(280.0);
+        let typed = ui.add(field).on_hover_text("A rough first move in plain words. Small changes only; your ears or Match reference (AI) refine it");
+        let submitted = typed.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if self.text_running.load(Ordering::Acquire) {
+            if ui.button("Cancel").clicked() {
+                self.text_cancel.store(true, Ordering::Release);
+            }
+        } else if self.text_model_found.load(Ordering::Acquire) {
+            let blocker = self.suite_job_blocker().or(self.text_request.trim().is_empty().then_some("Type what you'd like to change"));
+            let mut resp = ui.add_enabled(!busy && blocker.is_none(), egui::Button::new("Apply (AI)"));
+            if let Some(why) = blocker {
+                resp = resp.on_disabled_hover_text(why);
+            }
+            if resp.clicked() || (submitted && !busy && blocker.is_none()) {
+                self.run_text_request();
+            }
+        } else if ui
+            .add_enabled(!busy, egui::Button::new("Download text model (1.1 GB)"))
+            .on_hover_text("Qwen2.5-1.5B from huggingface.co. It runs on this computer, so requests never leave it")
+            .clicked()
+        {
+            self.download_text_model();
+        }
+    }
+
+    /// Why a job that sets up the built-in suite for one track can't run right now
+    fn suite_job_blocker(&self) -> Option<&'static str> {
+        if self.engine.audio_buffer().is_none() {
+            Some("Load a track first")
+        } else if self.view == View::Album {
+            Some("Works on a single track, not the album")
+        } else if self.engine.processing_mode() == ProcessingMode::Vst3 {
+            Some("Works on the built-in suite, not a fallback plugin")
+        } else {
+            None
+        }
+    }
+
+    /// Why Match reference (AI) can't run right now
+    fn style_match_blocker(&self, has_reference: bool) -> Option<&'static str> {
+        if !self.style_model_found {
+            Some("The style model models/afx_rep.onnx wasn't found")
+        } else if !has_reference {
+            Some("Load a reference track first")
+        } else {
+            self.suite_job_blocker()
+        }
     }
 
     fn transport(&mut self, ui: &mut egui::Ui, meters: &crate::audio::MeterLevels) {
@@ -988,6 +1388,11 @@ impl MasteringApp {
                 let mut loud = format!("I {:5.1}  S {:5.1} LUFS  TP {:5.1}", meters.integrated_lufs, meters.short_term_lufs, meters.true_peak_l_dbtp.max(meters.true_peak_r_dbtp));
                 if self.engine.ab_gain_match() {
                     loud.push_str(&format!("  match {:+.1} dB", meters.ab_match_db));
+                }
+                match self.engine.preview_mode() {
+                    PreviewMode::Codec => loud.push_str("  [codec preview]"),
+                    PreviewMode::Difference => loud.push_str("  [codec difference]"),
+                    PreviewMode::Off => {}
                 }
                 ui.label(RichText::new(loud).monospace().size(12.0).color(ACCENT));
             });
@@ -1086,6 +1491,18 @@ impl MasteringApp {
         self.device_dialog.open = open;
     }
 
+    fn qc_window(&mut self, ctx: &egui::Context) {
+        let Some(text) = self.qc_report.lock().clone() else { return };
+        let mut open = true;
+        egui::Window::new("Export QC").open(&mut open).resizable(false).show(ctx, |ui| {
+            ui.label(RichText::new(text).monospace());
+            ui.label(RichText::new("Saved next to the export as .qc.txt").color(DIM).size(11.0));
+        });
+        if !open {
+            *self.qc_report.lock() = None;
+        }
+    }
+
     fn assistant_window(&mut self, ctx: &egui::Context) {
         let Some(text) = self.assistant_report.clone() else { return };
         let mut open = true;
@@ -1094,6 +1511,30 @@ impl MasteringApp {
         });
         if !open {
             self.assistant_report = None;
+        }
+    }
+
+    fn style_match_window(&mut self, ctx: &egui::Context) {
+        let Some(text) = self.style_report.clone() else { return };
+        let mut open = true;
+        egui::Window::new("Match reference (AI)").open(&mut open).resizable(false).show(ctx, |ui| {
+            ui.label(RichText::new(text).monospace());
+            ui.label(RichText::new("Ctrl+Z undoes the whole match. Try it against another snapshot slot (Ctrl+1 to 4).").color(DIM).size(11.0));
+        });
+        if !open {
+            self.style_report = None;
+        }
+    }
+
+    fn text_request_window(&mut self, ctx: &egui::Context) {
+        let Some(text) = self.text_report.clone() else { return };
+        let mut open = true;
+        egui::Window::new("Text request (AI)").open(&mut open).resizable(false).show(ctx, |ui| {
+            ui.label(RichText::new(text).monospace());
+            ui.label(RichText::new("A rough first move from a small model: trust your ears. Ctrl+Z undoes it.").color(DIM).size(11.0));
+        });
+        if !open {
+            self.text_report = None;
         }
     }
 
@@ -1127,6 +1568,9 @@ impl MasteringApp {
 impl eframe::App for MasteringApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.engine.collect_garbage();
+        self.apply_assistant_result();
+        self.apply_style_match();
+        self.apply_text_request();
         self.handle_midi();
         self.handle_drops(ctx);
         self.handle_keys(ctx);
@@ -1183,6 +1627,9 @@ impl eframe::App for MasteringApp {
 
         self.device_window(ctx);
         self.assistant_window(ctx);
+        self.style_match_window(ctx);
+        self.text_request_window(ctx);
+        self.qc_window(ctx);
         self.handle_screenshot(ctx);
 
         let busy = self.busy.load(Ordering::Relaxed);
@@ -1196,6 +1643,13 @@ impl eframe::App for MasteringApp {
         self.engine.pause();
         self.engine.collect_garbage();
     }
+}
+
+/// Measure an exported file and save its QC report next to it
+pub(super) fn check_export(path: &Path, format: &str, targets: QcTargets) -> Result<QcReport, String> {
+    let report = crate::audio::qc::analyze_file(path, format, targets)?;
+    report.write_beside(path)?;
+    Ok(report)
 }
 
 /// Run `f` with the render source for the current processing mode; a fallback plugin is taken

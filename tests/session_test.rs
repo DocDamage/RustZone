@@ -88,7 +88,7 @@ fn test_session_round_trip() {
     snaps.copy_to(2, preset_with_drive(8.0));
 
     let session_path = std::env::temp_dir().join("session_test.mstsession");
-    let ui = SessionUiState { export_format: 2, loudness_target: 3 };
+    let ui = SessionUiState { export_format: 2, loudness_target: 3, assistant_genre: 4 };
     Session::capture(&engine, &snaps, Some(&track_path), None, ui).save(&session_path).unwrap();
 
     // Fresh engine, restore
@@ -99,6 +99,7 @@ fn test_session_round_trip() {
     assert!(warnings.is_empty(), "{:?}", warnings);
     assert_eq!(ui_back.export_format, 2);
     assert_eq!(ui_back.loudness_target, 3);
+    assert_eq!(ui_back.assistant_genre, 4);
     assert!(engine.audio_buffer().is_some());
     assert!((engine.trim_fade().trim_start_fraction - 0.1).abs() < 1e-9);
     assert!(engine.ab_gain_match());

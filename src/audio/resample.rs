@@ -68,12 +68,9 @@ impl SincResampler {
         let mut out_l = Vec::with_capacity(out_frames);
         let mut out_r = Vec::with_capacity(out_frames);
 
-        // Anti-aliasing cutoff factor: clamp cutoff when downsampling to avoid aliasing
-        let cutoff = if to_sr < from_sr {
-            (to_sr as f32 / from_sr as f32) * 0.94 // 6% transition band margin
-        } else {
-            0.94
-        };
+        // Anti-aliasing cutoff in cycles per input sample, just under the lower Nyquist frequency
+        // (6% transition band margin)
+        let cutoff = 0.47 * (to_sr as f32 / from_sr as f32).min(1.0);
 
         let i0_beta = bessel_i0(self.kaiser_beta);
         let n = in_left.len();

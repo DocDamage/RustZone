@@ -12,7 +12,7 @@ jobs:
   build-and-test:
     runs-on: windows-latest
     steps:
-      # The 174 MB stem model is in Git LFS; CI skips the model test instead of using LFS bandwidth
+      # The ONNX models are in Git LFS; CI skips the model tests instead of using LFS bandwidth
       - uses: actions/checkout@v4
         with:
           lfs: false
@@ -29,7 +29,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
-      # Runners have no audio device: device tests skip themselves
+      # Device tests skip themselves on CI (CI=true); run them locally on real hardware
       - name: Test
         run: cargo test --locked -- --test-threads=1
 

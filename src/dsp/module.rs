@@ -75,6 +75,18 @@ impl ParamInfo {
         }
     }
 
+    /// Nearest value on the grid of wheel notches, counted from `min`
+    pub fn snapped(&self, value: f32) -> f32 {
+        let v = value.clamp(self.min, self.max);
+        let snapped = if self.log {
+            let notch = (1.0 + self.step).ln();
+            self.min * ((v / self.min).ln() / notch).round().mul_add(notch, 0.0).exp()
+        } else {
+            self.min + ((v - self.min) / self.step).round() * self.step
+        };
+        snapped.clamp(self.min, self.max)
+    }
+
     pub fn format(&self, value: f32) -> String {
         match self.unit {
             ParamUnit::Db => format!("{:+.1} dB", value),
@@ -123,6 +135,14 @@ pub trait Module {
     /// oversampled, the downsampling filter can overshoot it, so the suite re-applies it.
     fn output_ceiling(&self) -> Option<f32> {
         None
+    }
+    /// STFT-domain modules expose their frame processing so the suite can run neighbours in one
+    /// shared spectral pass
+    fn spectral(&mut self) -> Option<&mut dyn super::stft::SpectralProcess> {
+        None
+    }
+    fn is_spectral(&self) -> bool {
+        false
     }
 }
 

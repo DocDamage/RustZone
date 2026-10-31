@@ -11,6 +11,11 @@ pub struct Radix2Fft {
 }
 
 impl Radix2Fft {
+    /// Empty stand-in that allocates nothing (not usable for transforms)
+    pub(crate) fn placeholder() -> Self {
+        Self { n: 0, twiddles_cos: Vec::new(), twiddles_sin: Vec::new(), bit_rev: Vec::new() }
+    }
+
     pub fn new(n: usize) -> Self {
         assert!(n.is_power_of_two() && n >= 2, "FFT size must be a power of two >= 2");
         let mut twiddles_cos = Vec::with_capacity(n / 2);

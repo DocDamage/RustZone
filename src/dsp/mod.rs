@@ -14,6 +14,9 @@ pub mod oversampling;
 pub mod spectral;
 pub mod transient;
 pub mod vintage;
+pub mod style_space;
+pub mod style_match;
+pub mod text_edit;
 mod core_modules;
 
 pub use lufs::*;
@@ -30,6 +33,9 @@ pub use module::{Module, ModuleKind, ParamInfo, ParamUnit};
 pub use spectral::*;
 pub use transient::*;
 pub use vintage::*;
+pub use style_space::{SearchParam, SearchSpace};
+pub use style_match::{match_to_reference, MatchOptions, MatchProgress, MatchResult};
+pub use text_edit::{plan_request, TextPlan};
 
 use std::f32::consts::PI;
 
@@ -437,6 +443,49 @@ impl AutoGain {
     }
 }
 
+/// Most shared spectral passes a chain can form (five spectral modules, two or more per pass)
+const MAX_SPECTRAL_PASSES: usize = 2;
+
+/// State of the shared spectral passes: neighbouring spectral modules (only switched-off modules
+/// between them) are analysed and resynthesised once, by one STFT, instead of once each
+#[derive(Clone, Debug)]
+struct SpectralPasses {
+    stft: [stft::StftProcessor; MAX_SPECTRAL_PASSES],
+    /// Stem masks computed once per frame for the stem modules in a pass
+    masker: [StemMasker; MAX_SPECTRAL_PASSES],
+    /// Members of each pass (bit per `ModuleKind::index`) when it last ran
+    members: [u32; MAX_SPECTRAL_PASSES],
+    /// Every module that ran inside a pass during the last block
+    grouped: u32,
+}
+
+impl SpectralPasses {
+    fn new() -> Self {
+        Self {
+            stft: [stft::StftProcessor::new(), stft::StftProcessor::new()],
+            masker: [StemMasker::default(), StemMasker::default()],
+            members: [0; MAX_SPECTRAL_PASSES],
+            grouped: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        for i in 0..MAX_SPECTRAL_PASSES {
+            self.stft[i].reset();
+            self.masker[i].reset();
+        }
+    }
+}
+
+/// One processing step of the chain
+#[derive(Clone, Copy)]
+enum ChainStep {
+    /// A module on its own, at chain position `pos`
+    Single(usize),
+    /// A shared spectral pass over the active spectral modules in chain positions `start..end`
+    Pass { start: usize, end: usize },
+}
+
 /// The complete built-in mastering suite: an ordered chain of modules plus metering
 #[derive(Clone, Debug)]
 pub struct MasteringSuite {
@@ -470,6 +519,7 @@ pub struct MasteringSuite {
     /// Stem Rebalance / Stem EQ to the real stems), so the real-time approximations step aside
     pub external_stems: bool,
     auto_gain_state: Vec<AutoGain>,
+    spectral_passes: Option<Box<SpectralPasses>>,
     pub lufs_meter: EbuR128Meter,
     pub spectral_analyzer: SpectralAnalyzer,
     pub sample_rate: f32,
@@ -503,6 +553,7 @@ impl MasteringSuite {
             oversamplers: (0..ModuleKind::COUNT).map(|_| oversampling::Oversampler::new(1)).collect(),
             external_stems: false,
             auto_gain_state: vec![AutoGain::new(sample_rate); ModuleKind::COUNT],
+            spectral_passes: Some(Box::new(SpectralPasses::new())),
             lufs_meter: EbuR128Meter::new(sample_rate),
             spectral_analyzer: SpectralAnalyzer::new(sample_rate),
             sample_rate,
@@ -647,22 +698,82 @@ impl MasteringSuite {
         for ag in self.auto_gain_state.iter_mut() {
             ag.reset();
         }
+        if let Some(passes) = self.spectral_passes.as_mut() {
+            passes.reset();
+        }
         self.lufs_meter.reset();
         self.spectral_analyzer.reset();
     }
 
-    /// Processing delay of the chain in samples (sum of enabled modules' latencies)
+    /// Processing delay of the chain in samples: each module on its own adds its latency, and a
+    /// shared spectral pass adds one STFT length however many modules it holds
     pub fn latency_samples(&self) -> usize {
-        self.chain
-            .iter()
-            .filter(|&&k| !(self.external_stems && Self::is_stem_module(k)))
-            .filter(|&&k| self.module(k).enabled())
-            .map(|&k| {
-                // A module's own latency is counted at its (possibly oversampled) rate
-                let factor = self.oversampling[k.index()];
-                self.module(k).latency() / factor + self.oversamplers[k.index()].latency()
-            })
-            .sum()
+        let mut total = 0;
+        let mut pos = 0;
+        while let Some((step, next)) = self.next_step(pos) {
+            total += match step {
+                ChainStep::Single(p) => {
+                    // A module's own latency is counted at its (possibly oversampled) rate
+                    let k = self.chain[p];
+                    let factor = self.oversampling[k.index()];
+                    self.module(k).latency() / factor + self.oversamplers[k.index()].latency()
+                }
+                ChainStep::Pass { .. } => stft::STFT_SIZE,
+            };
+            pos = next;
+        }
+        total
+    }
+
+    /// Number of modules sharing a spectral pass (shown in the editor)
+    pub fn shared_spectral_modules(&self) -> usize {
+        let mut count = 0;
+        let mut pos = 0;
+        while let Some((step, next)) = self.next_step(pos) {
+            if let ChainStep::Pass { start, end } = step {
+                count += (start..end).filter(|&p| self.is_active(self.chain[p])).count();
+            }
+            pos = next;
+        }
+        count
+    }
+
+    /// Whether a module processes this block
+    fn is_active(&self, kind: ModuleKind) -> bool {
+        self.module(kind).enabled() && !(self.external_stems && Self::is_stem_module(kind))
+    }
+
+    /// Whether an active module can join a shared spectral pass. Auto gain-match measures a
+    /// module's own input and output, so those modules keep their own STFT.
+    fn joins_pass(&self, kind: ModuleKind) -> bool {
+        self.module(kind).is_spectral() && !self.auto_gain[kind.index()] && self.oversampling[kind.index()] == 1
+    }
+
+    /// The processing step starting at chain position `pos` or later, and where the next one starts
+    fn next_step(&self, mut pos: usize) -> Option<(ChainStep, usize)> {
+        while pos < self.chain.len() && !self.is_active(self.chain[pos]) {
+            pos += 1;
+        }
+        if pos >= self.chain.len() {
+            return None;
+        }
+        if !self.joins_pass(self.chain[pos]) {
+            return Some((ChainStep::Single(pos), pos + 1));
+        }
+        let mut members = 1;
+        let mut end = pos + 1;
+        for p in pos + 1..self.chain.len() {
+            let k = self.chain[p];
+            if !self.is_active(k) {
+                continue;
+            }
+            if !self.joins_pass(k) {
+                break;
+            }
+            members += 1;
+            end = p + 1;
+        }
+        Some(if members >= 2 { (ChainStep::Pass { start: pos, end }, end) } else { (ChainStep::Single(pos), pos + 1) })
     }
 
     fn is_stem_module(kind: ModuleKind) -> bool {
@@ -676,41 +787,125 @@ impl MasteringSuite {
 
     /// Process audio through the mastering chain. Dither is applied at export time by the renderer.
     pub fn process_stereo(&mut self, left: &mut [f32], right: &mut [f32]) {
-        let sr = self.sample_rate;
-        for i in 0..self.chain.len() {
-            let kind = self.chain[i];
-            if !self.module(kind).enabled() || (self.external_stems && Self::is_stem_module(kind)) {
-                continue;
-            }
-            let idx = kind.index();
-            let auto = self.auto_gain[idx];
-            if auto {
-                self.auto_gain_state[idx].pre.feed(left, right);
-            }
-            if self.oversampling[idx] > 1 {
-                // Borrow the oversampler out (an empty 1x one allocates nothing) so the closure
-                // can borrow the module
-                let mut os = std::mem::replace(&mut self.oversamplers[idx], oversampling::Oversampler::new(1));
-                os.process(left, right, &mut |l, r| self.module_mut(kind).process(l, r));
-                self.oversamplers[idx] = os;
-                // Filter ringing from downsampling can poke past a limiter's ceiling
-                if let Some(ceiling) = self.module(kind).output_ceiling() {
-                    for v in left.iter_mut().chain(right.iter_mut()) {
-                        *v = v.clamp(-ceiling, ceiling);
-                    }
+        let mut passes = self.spectral_passes.take().unwrap_or_else(|| Box::new(SpectralPasses::new()));
+        self.regroup_spectral(&mut passes);
+
+        let mut pos = 0;
+        let mut pass_index = 0;
+        while let Some((step, next)) = self.next_step(pos) {
+            match step {
+                ChainStep::Single(p) => self.process_module(self.chain[p], left, right),
+                ChainStep::Pass { start, end } => {
+                    self.process_pass(&mut passes, pass_index.min(MAX_SPECTRAL_PASSES - 1), start, end, left, right);
+                    pass_index += 1;
                 }
-            } else {
-                self.module_mut(kind).process(left, right);
             }
-            if auto {
-                let ag = &mut self.auto_gain_state[idx];
-                ag.post.feed(left, right);
-                ag.apply(left, right, sr);
-            }
+            pos = next;
         }
+        self.spectral_passes = Some(passes);
 
         // Feed EBU R128 Loudness Meter & Real-Time Spectral Analyzer
         self.lufs_meter.process_block(left, right);
         self.spectral_analyzer.feed_samples(left, right);
+    }
+
+    /// Restart passes whose membership changed, and reset modules that moved into or out of a
+    /// pass (their own STFT, or the pass's, holds audio from before the change)
+    fn regroup_spectral(&mut self, passes: &mut SpectralPasses) {
+        let mut members = [0u32; MAX_SPECTRAL_PASSES];
+        let mut grouped = 0u32;
+        let mut pos = 0;
+        let mut pass_index = 0;
+        while let Some((step, next)) = self.next_step(pos) {
+            if let ChainStep::Pass { start, end } = step {
+                let slot = pass_index.min(MAX_SPECTRAL_PASSES - 1);
+                for p in start..end {
+                    let k = self.chain[p];
+                    if self.is_active(k) {
+                        members[slot] |= 1 << k.index();
+                    }
+                }
+                grouped |= members[slot];
+                pass_index += 1;
+            }
+            pos = next;
+        }
+        for slot in 0..MAX_SPECTRAL_PASSES {
+            if members[slot] != passes.members[slot] {
+                passes.stft[slot].reset();
+                passes.masker[slot].reset();
+                passes.members[slot] = members[slot];
+            }
+        }
+        let moved = grouped ^ passes.grouped;
+        if moved != 0 {
+            for &kind in ModuleKind::ALL {
+                if moved & (1 << kind.index()) != 0 {
+                    self.module_mut(kind).reset();
+                }
+            }
+            passes.grouped = grouped;
+        }
+    }
+
+    /// Run one module on its own, with oversampling and auto gain-match if switched on
+    fn process_module(&mut self, kind: ModuleKind, left: &mut [f32], right: &mut [f32]) {
+        let sr = self.sample_rate;
+        let idx = kind.index();
+        let auto = self.auto_gain[idx];
+        if auto {
+            self.auto_gain_state[idx].pre.feed(left, right);
+        }
+        if self.oversampling[idx] > 1 {
+            // Borrow the oversampler out (an empty 1x one allocates nothing) so the closure
+            // can borrow the module
+            let mut os = std::mem::replace(&mut self.oversamplers[idx], oversampling::Oversampler::new(1));
+            os.process(left, right, &mut |l, r| self.module_mut(kind).process(l, r));
+            self.oversamplers[idx] = os;
+            // Filter ringing from downsampling can poke past a limiter's ceiling
+            if let Some(ceiling) = self.module(kind).output_ceiling() {
+                for v in left.iter_mut().chain(right.iter_mut()) {
+                    *v = v.clamp(-ceiling, ceiling);
+                }
+            }
+        } else {
+            self.module_mut(kind).process(left, right);
+        }
+        if auto {
+            let ag = &mut self.auto_gain_state[idx];
+            ag.post.feed(left, right);
+            ag.apply(left, right, sr);
+        }
+    }
+
+    /// Run the active spectral modules in chain positions `start..end` through one shared STFT
+    fn process_pass(&mut self, passes: &mut SpectralPasses, slot: usize, start: usize, end: usize, left: &mut [f32], right: &mut [f32]) {
+        let mut members = [ModuleKind::Equalizer; ModuleKind::COUNT];
+        let mut count = 0;
+        let mut needs_masks = false;
+        for p in start..end {
+            let k = self.chain[p];
+            if self.is_active(k) {
+                members[count] = k;
+                count += 1;
+                needs_masks |= self.module_mut(k).spectral().is_some_and(|m| m.uses_stem_masks());
+            }
+        }
+        let sr = self.sample_rate;
+        let SpectralPasses { stft, masker, .. } = passes;
+        let masker = &mut masker[slot];
+        stft[slot].process(left, right, &mut |frame| {
+            let analysis = if needs_masks {
+                masker.analyze(frame, sr);
+                stft::FrameAnalysis { stem_masks: Some(&masker.masks) }
+            } else {
+                stft::FrameAnalysis::default()
+            };
+            for &k in &members[..count] {
+                if let Some(m) = self.module_mut(k).spectral() {
+                    m.process_frame(frame, &analysis);
+                }
+            }
+        });
     }
 }

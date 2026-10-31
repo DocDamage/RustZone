@@ -6,7 +6,7 @@
 //! so it is freed on the UI side. Meters come back through atomics and a snapshot the audio thread
 //! only updates when nobody is reading it.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -16,6 +16,7 @@ use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 
 use super::buffer::AudioBuffer;
+use super::codec_preview::{CodecPreview, PreviewMode};
 use super::ml_separator::{self, StemBus, StemSet};
 use super::montage::AlbumMontage;
 use super::separator::StemSeparator;
@@ -103,6 +104,7 @@ enum Command {
     SetTrimFade(TrimFadeSettings),
     SetPlugin(Option<Arc<Vst3Plugin>>),
     SetStems(Option<Arc<StemSet>>),
+    SetCodecPreview(Option<Arc<CodecPreview>>),
     ResetProcessing,
 }
 
@@ -115,6 +117,7 @@ enum Garbage {
     Buffer(Arc<AudioBuffer>),
     Plugin(Arc<Vst3Plugin>),
     Stems(Arc<StemSet>),
+    CodecPreview(Arc<CodecPreview>),
 }
 
 /// Readings the audio thread publishes; read with a short lock, written with `try_lock`
@@ -169,6 +172,8 @@ struct Shared {
     looping: AtomicBool,
     referencing: AtomicBool,
     ab_match: AtomicBool,
+    /// `PreviewMode` as u8: what plays while a codec preview is loaded
+    preview_mode: AtomicU8,
     /// Commands the audio thread has applied (compared against `UiState::commands_sent`)
     commands_applied: AtomicU64,
     peak_l: AtomicF32,
@@ -189,6 +194,7 @@ struct RtState {
     plugin: Option<Arc<Vst3Plugin>>,
     stems: Option<Arc<StemSet>>,
     stem_bus: StemBus,
+    codec_preview: Option<Arc<CodecPreview>>,
     commands: HeapCons<Command>,
     garbage: HeapProd<Garbage>,
     dry_loudness: LoudnessFollower,
@@ -256,6 +262,11 @@ impl RtState {
                         self.discard(Garbage::Stems(old));
                     }
                 }
+                Command::SetCodecPreview(p) => {
+                    if let Some(old) = std::mem::replace(&mut self.codec_preview, p) {
+                        self.discard(Garbage::CodecPreview(old));
+                    }
+                }
                 Command::ResetProcessing => self.reset_processing(),
             }
         }
@@ -313,6 +324,8 @@ struct UiState {
     stem_mixer: StemMixer,
     /// Trained-model stems and the exact buffer they were separated from
     ml_stems: Option<(Arc<AudioBuffer>, Arc<StemSet>)>,
+    /// Codec preview of the loaded buffer (cleared whenever the buffer changes)
+    codec_preview: Option<Arc<CodecPreview>>,
     commands: HeapProd<Command>,
     commands_sent: u64,
 }
@@ -534,6 +547,7 @@ fn new_rt_state(ui: &UiState, sr: f32, commands: HeapCons<Command>, garbage: Hea
             _ => None,
         },
         stem_bus: StemBus::new(sr),
+        codec_preview: ui.codec_preview.clone(),
         commands,
         garbage,
         dry_loudness: LoudnessFollower::new(sr, 3.0),
@@ -614,6 +628,7 @@ impl AudioEngine {
             looping: AtomicBool::new(false),
             referencing: AtomicBool::new(false),
             ab_match: AtomicBool::new(false),
+            preview_mode: AtomicU8::new(0),
             commands_applied: AtomicU64::new(0),
             peak_l: AtomicF32::default(),
             peak_r: AtomicF32::default(),
@@ -636,6 +651,7 @@ impl AudioEngine {
             single_track_buffer: None,
             stem_mixer: StemMixer::default(),
             ml_stems: None,
+            codec_preview: None,
             commands: cmd_prod,
             commands_sent: 0,
         };
@@ -748,7 +764,8 @@ impl AudioEngine {
         let mut cur_fixed = shared.cursor.load(Ordering::Relaxed);
 
         // Split borrows: the scratch buffers and the rest of the state are separate fields
-        let RtState { suite, buffer, reference, reference_gain, mode, trim_fade, plugin, stems, stem_bus, dry_loudness, wet_loudness, ab_gain, in_l, in_r, out_l, out_r, .. } = rt;
+        let preview_mode = shared.preview_mode.load(Ordering::Relaxed);
+        let RtState { suite, buffer, reference, reference_gain, mode, trim_fade, plugin, stems, stem_bus, codec_preview, dry_loudness, wet_loudness, ab_gain, in_l, in_r, out_l, out_r, .. } = rt;
         let (in_l, in_r) = (&mut in_l[..num_frames], &mut in_r[..num_frames]);
         let (out_l, out_r) = (&mut out_l[..num_frames], &mut out_r[..num_frames]);
 
@@ -776,6 +793,7 @@ impl AudioEngine {
             suite.lufs_meter.process_block(out_l, out_r);
             suite.spectral_analyzer.feed_samples(out_l, out_r);
         } else {
+            let mut previewing: Option<&AudioBuffer> = None;
             if let Some(buf) = buffer.as_deref() {
                 let total_frames = buf.num_frames();
                 if total_frames > 0 {
@@ -786,6 +804,16 @@ impl AudioEngine {
                     }
                     // Fractional step per device output frame for pitch-correct playback
                     let step = ((buf.sample_rate as f64 / device_sr as f64) * FP_ONE) as u64;
+                    // A codec preview of this buffer plays the encoded master (or what the codec
+                    // removed) in place of the live chain
+                    previewing = codec_preview
+                        .as_deref()
+                        .filter(|p| p.decoded.num_frames() == total_frames)
+                        .and_then(|p| match preview_mode {
+                            1 => Some(&p.decoded),
+                            2 => Some(&p.difference),
+                            _ => None,
+                        });
                     // With trained stems for this buffer, Stem Rebalance / Stem EQ act on the real
                     // stems (mixed here, in front of the chain) instead of the spectral approximation
                     let stem_src = stems
@@ -806,9 +834,10 @@ impl AudioEngine {
                             }
                         }
                         let pos = cur_fixed as f64 / FP_ONE;
-                        let (s_l, s_r) = match stem_src {
-                            Some(st) => stem_bus.mix(st.frames_at(pos)),
-                            None => buf.get_interpolated_frame(pos),
+                        let (s_l, s_r) = match (previewing, stem_src) {
+                            (Some(p), _) => p.get_interpolated_frame(pos),
+                            (None, Some(st)) => stem_bus.mix(st.frames_at(pos)),
+                            (None, None) => buf.get_interpolated_frame(pos),
                         };
                         let fade = trim_fade.calculate_gain(cur_frame_idx, start_frame, end_frame, buf.sample_rate);
                         in_l[i] = s_l * fade;
@@ -821,6 +850,8 @@ impl AudioEngine {
             out_l.copy_from_slice(in_l);
             out_r.copy_from_slice(in_r);
             let processed = match *mode {
+                // The preview is already the finished master
+                _ if previewing.is_some() => false,
                 ProcessingMode::Vst3 => {
                     if let Some(p) = plugin.as_deref() {
                         p.process_stereo(in_l, in_r, out_l, out_r);
@@ -835,7 +866,7 @@ impl AudioEngine {
                 }
                 ProcessingMode::Bypass => false,
             };
-            if !matches!(*mode, ProcessingMode::DspSuite) {
+            if !matches!(*mode, ProcessingMode::DspSuite) || previewing.is_some() {
                 suite.lufs_meter.process_block(out_l, out_r);
                 suite.spectral_analyzer.feed_samples(out_l, out_r);
             }
@@ -993,6 +1024,7 @@ impl AudioEngine {
         self.shared.cursor.store(0, Ordering::Relaxed);
         ui.send(Command::SetBuffer(Some(buffer)));
         Self::clear_ml_stems(&mut ui);
+        self.clear_codec_preview(&mut ui);
         ui.send(Command::ResetProcessing);
     }
 
@@ -1066,6 +1098,7 @@ impl AudioEngine {
         ui.audio_buffer = buffer.clone();
         ui.send(Command::SetBuffer(buffer));
         Self::clear_ml_stems(&mut ui);
+        self.clear_codec_preview(&mut ui);
     }
 
     /// Shared handle to the loaded track (cheap; no copy)
@@ -1092,6 +1125,52 @@ impl AudioEngine {
     pub fn with_reference_buffer<R>(&self, f: impl FnOnce(Option<&AudioBuffer>) -> R) -> R {
         let buf = self.reference_buffer();
         f(buf.as_deref())
+    }
+
+    /// Load (or clear) a codec preview of the current buffer. Playback switches to it with
+    /// `set_preview_mode`.
+    pub fn set_codec_preview(&self, preview: Option<CodecPreview>) {
+        let preview = preview.map(Arc::new);
+        let mut ui = self.ui.lock();
+        if preview.is_none() {
+            self.shared.preview_mode.store(0, Ordering::Relaxed);
+        }
+        ui.codec_preview = preview.clone();
+        ui.send(Command::SetCodecPreview(preview));
+    }
+
+    pub fn codec_preview(&self) -> Option<Arc<CodecPreview>> {
+        self.ui.lock().codec_preview.clone()
+    }
+
+    fn clear_codec_preview(&self, ui: &mut UiState) {
+        if ui.codec_preview.take().is_some() {
+            self.shared.preview_mode.store(0, Ordering::Relaxed);
+            ui.send(Command::SetCodecPreview(None));
+        }
+    }
+
+    /// Switch playback between the live chain and the loaded codec preview
+    pub fn set_preview_mode(&self, mode: PreviewMode) {
+        let mut ui = self.ui.lock();
+        let mode = if ui.codec_preview.is_some() { mode } else { PreviewMode::Off };
+        let code = match mode {
+            PreviewMode::Off => 0,
+            PreviewMode::Codec => 1,
+            PreviewMode::Difference => 2,
+        };
+        if self.shared.preview_mode.swap(code, Ordering::Relaxed) != code {
+            // The chain sat idle while the preview played: don't resume on stale filter state
+            ui.send(Command::ResetProcessing);
+        }
+    }
+
+    pub fn preview_mode(&self) -> PreviewMode {
+        match self.shared.preview_mode.load(Ordering::Relaxed) {
+            1 => PreviewMode::Codec,
+            2 => PreviewMode::Difference,
+            _ => PreviewMode::Off,
+        }
     }
 
     pub fn set_referencing(&self, enabled: bool) {
@@ -1211,6 +1290,7 @@ impl AudioEngine {
         self.shared.cursor.store(0, Ordering::Relaxed);
         ui.send(Command::SetBuffer(next));
         Self::clear_ml_stems(&mut ui);
+        self.clear_codec_preview(&mut ui);
         ui.send(Command::ResetProcessing);
     }
 
@@ -1336,13 +1416,18 @@ impl AudioEngine {
         self.ui.lock().suite.clone()
     }
 
-    /// Run intelligent Master Assistant profiling on the loaded track
-    pub fn run_master_assistant(&self, target_lufs: f32) -> Result<MasterAssistantReport, String> {
+    /// Run Master Assistant analysis on the loaded track (slow: run it off the UI thread). With
+    /// `use_reference`, a loaded reference track is the target instead of the genre profile.
+    pub fn analyze_for_assistant(&self, target_lufs: f32, ceiling_dbtp: f32, genre: usize, use_reference: bool) -> Result<MasterAssistantReport, String> {
         let buf = self.audio_buffer().ok_or("No audio track loaded to analyze")?;
-        let report = MasterAssistant::analyze(&buf, target_lufs)?;
+        let reference = if use_reference { self.reference_buffer() } else { None };
+        MasterAssistant::analyze_with(&buf, &crate::dsp::AssistantOptions { target_lufs, ceiling_dbtp, genre, reference: reference.as_deref() })
+    }
+
+    /// Set the suite up as a Master Assistant report suggests
+    pub fn apply_assistant(&self, report: &MasterAssistantReport) {
         let applied = report.clone();
         self.edit_dsp_suite(move |s| MasterAssistant::apply_to_suite(&applied, s));
-        Ok(report)
     }
 
     /// Learn Match EQ from the loaded reference track (target) and main track (source), then

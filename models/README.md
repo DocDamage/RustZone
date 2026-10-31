@@ -37,3 +37,48 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## afx_rep.onnx
+
+Production-style model used for "Match reference (AI)". It scores how close two clips sound
+(EQ, dynamics, width, saturation) and never processes audio. Stored with Git LFS.
+
+- **Model:** AFx-Rep, a Cnn14 encoder from ST-ITO by Steinmetz et al. —
+  *ST-ITO: Controlling Audio Effects for Style Transfer with Inference-Time Optimization*,
+  ISMIR 2024. <https://github.com/csteinmetz1/st-ito>
+- **Weights:** `afx-rep.ckpt` from <https://huggingface.co/csteinmetz1/afx-rep>
+  (revision `6582cb5414094146759319819a4242967ecc7e39`), published under Apache-2.0.
+  The Cnn14 architecture derives from PANNs (MIT).
+- **ONNX conversion:** `export_afx_rep.py` in this folder (opset 17, 77.6 M parameters, 48 kHz).
+  The STFT is externalised and performed in `src/audio/ml_style.rs`; the checkpoint's mel
+  filterbank stays in the graph. Input `power` is `[batch * 2, 1, frames, 1025]` (mid, side, ...);
+  outputs `mid` and `side` are `[batch, 512]`. This is a modified form of the original weights.
+- **Parity:** cosine 1.000000 against PyTorch on 10 clips of the demo track. Roughly 0.1 s per
+  4 s clip on a 20-thread CPU.
+- **SHA-256:** `761a5d7e6bee5e67df2ea474b57c1bd7cf46e376aa3460ad4e84322452711fec`
+
+To reproduce it, with the checkpoint downloaded (it's read with `weights_only=True`, so nothing
+from the st-ito repository runs):
+
+```bash
+python -I models/export_afx_rep.py afx-rep.ckpt models/afx_rep.onnx demo_mastering_track.wav fixture.bin
+```
+
+The last 4096 bytes of `fixture.bin` are `tests/fixtures/afx_rep_demo_embedding.bin`.
+
+### Licence (AFx-Rep)
+
+Apache License 2.0: <https://www.apache.org/licenses/LICENSE-2.0>
+
+## Text model (not bundled)
+
+**Describe (AI)** uses a small language model that the app downloads on first use, after you
+click **Download text model**, to `%LOCALAPPDATA%\MasteringStudio\models`. It's also found here
+in `models/`, where Git ignores it.
+
+- **Model:** Qwen2.5-1.5B-Instruct by Alibaba Cloud (Apache-2.0),
+  <https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF>, revision
+  `91cad51170dc346986eccefdc2dd33a9da36ead9`.
+- **File:** `qwen2.5-1.5b-instruct-q4_k_m.gguf`, 1,117,320,736 bytes.
+- **SHA-256:** `6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e`, checked
+  before the download takes the model's name.

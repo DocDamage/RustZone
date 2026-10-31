@@ -207,9 +207,11 @@ pub struct Session {
     pub album_artist: String,
     pub target_album_lufs: f32,
     pub montage: Vec<SessionMontageTrack>,
-    /// UI choices (export format, loudness target), stored as indices
+    /// UI choices (export format, loudness target, Assistant genre), stored as indices
     pub export_format: usize,
     pub loudness_target: usize,
+    #[serde(default)]
+    pub assistant_genre: usize,
 }
 
 /// UI-level choices that live outside the engine
@@ -217,6 +219,7 @@ pub struct Session {
 pub struct SessionUiState {
     pub export_format: usize,
     pub loudness_target: usize,
+    pub assistant_genre: usize,
 }
 
 impl Session {
@@ -270,6 +273,7 @@ impl Session {
             montage,
             export_format: ui.export_format,
             loudness_target: ui.loudness_target,
+            assistant_genre: ui.assistant_genre,
         }
     }
 
@@ -348,6 +352,6 @@ impl Session {
             }
         });
 
-        (warnings, SessionUiState { export_format: self.export_format, loudness_target: self.loudness_target })
+        (warnings, SessionUiState { export_format: self.export_format, loudness_target: self.loudness_target, assistant_genre: self.assistant_genre })
     }
 }
