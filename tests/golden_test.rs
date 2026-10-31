@@ -64,7 +64,7 @@ fn check(name: &str, out: &[f32]) {
         return;
     }
     let bytes = std::fs::read(&path).unwrap();
-    let golden: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let golden: Vec<f32> = bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
     assert_eq!(golden.len(), out.len(), "{}: length changed", name);
     let mut max_diff = 0.0f32;
     let mut worst = 0;
