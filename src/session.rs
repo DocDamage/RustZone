@@ -84,16 +84,12 @@ pub const SLOT_NAMES: [&str; 4] = ["A", "B", "C", "D"];
 
 /// Four snapshot slots for comparing whole-chain settings. The active slot follows edits, so
 /// switching away and back returns to where you left it.
+#[derive(Default)]
 pub struct Snapshots {
     slots: [Option<XmlPreset>; 4],
     active: usize,
 }
 
-impl Default for Snapshots {
-    fn default() -> Self {
-        Self { slots: [None, None, None, None], active: 0 }
-    }
-}
 
 impl Snapshots {
     pub fn active(&self) -> usize {

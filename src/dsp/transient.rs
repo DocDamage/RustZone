@@ -2,7 +2,7 @@
 //! and Bass Enhancer. Transients are detected as the ratio between a fast and a slow envelope.
 
 use super::module::{db_to_gain, gain_to_db, time_coeff, Envelope, Module, ParamInfo, ParamUnit};
-use super::multiband::LinkwitzRiley4;
+use super::multiband::{Crossover4, LinkwitzRiley4};
 use super::{BiquadFilter, FilterType};
 
 /// Fast/slow envelope pair whose ratio rises above 1 on attacks and falls below 1 in sustains
@@ -149,7 +149,7 @@ pub struct MultibandTransient {
     pub enabled: bool,
     pub punch: [f32; 4],
     pub crossovers_hz: [f32; 3],
-    splits: [LinkwitzRiley4; 3],
+    splits: Crossover4,
     detectors: [TransientDetector; 4],
     coeffs: DetectorCoeffs,
     sample_rate: f32,
@@ -161,7 +161,7 @@ impl MultibandTransient {
             enabled: false,
             punch: [0.0; 4],
             crossovers_hz: [150.0, 1500.0, 6000.0],
-            splits: [LinkwitzRiley4::new(150.0, sample_rate); 3],
+            splits: Crossover4::new([150.0, 1500.0, 6000.0], sample_rate),
             detectors: [TransientDetector::default(); 4],
             coeffs: DetectorCoeffs::new(sample_rate, 0.6),
             sample_rate,
@@ -171,9 +171,7 @@ impl MultibandTransient {
     }
 
     fn rebuild(&mut self) {
-        for i in 0..3 {
-            self.splits[i] = LinkwitzRiley4::new(self.crossovers_hz[i], self.sample_rate);
-        }
+        self.splits = Crossover4::new(self.crossovers_hz, self.sample_rate);
         self.coeffs = DetectorCoeffs::new(self.sample_rate, 0.6);
     }
 }
@@ -207,7 +205,7 @@ impl Module for MultibandTransient {
         self.rebuild();
     }
     fn reset(&mut self) {
-        for s in self.splits.iter_mut() { s.reset(); }
+        self.splits.reset();
         for d in self.detectors.iter_mut() { d.reset(); }
     }
     fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
@@ -215,11 +213,8 @@ impl Module for MultibandTransient {
             return; // neutral settings: leave the signal untouched (no crossover phase shift)
         }
         for (l, r) in left.iter_mut().zip(right.iter_mut()) {
-            // Successive splits: band 0 = below c1, band 1 = c1..c2, band 2 = c2..c3, band 3 = above c3
-            let (b0, rest) = self.splits[0].split(*l, *r);
-            let (b1, rest) = self.splits[1].split(rest.0, rest.1);
-            let (b2, b3) = self.splits[2].split(rest.0, rest.1);
-            let bands = [b0, b1, b2, b3];
+            // Band 0 = below c1, band 1 = c1..c2, band 2 = c2..c3, band 3 = above c3
+            let bands = self.splits.split(*l, *r);
             let (mut ol, mut or) = (0.0, 0.0);
             for (i, (bl, br)) in bands.iter().enumerate() {
                 let k = if self.punch[i].abs() < 1e-4 {
@@ -378,6 +373,7 @@ impl BassEnhancer {
 }
 
 impl Module for BassEnhancer {
+    fn oversampling_default(&self) -> usize { 2 }
     fn enabled(&self) -> bool { self.enabled }
     fn set_enabled(&mut self, e: bool) { self.enabled = e; }
     fn params(&self) -> Vec<ParamInfo> {

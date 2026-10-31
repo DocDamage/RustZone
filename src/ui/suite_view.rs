@@ -14,6 +14,8 @@ struct ViewModel {
     enabled: bool,
     auto_gain: bool,
     auto_gain_db: f32,
+    /// Oversampling factor, when the module offers it
+    oversampling: Option<usize>,
     status: Option<String>,
     meters: [f32; 4],
     latency: usize,
@@ -31,6 +33,7 @@ pub fn show(app: &mut MasteringApp, ui: &mut egui::Ui, meters: &MeterLevels) {
             enabled: m.enabled(),
             auto_gain: s.auto_gain[selected.index()],
             auto_gain_db: s.auto_gain_db(selected),
+            oversampling: s.supports_oversampling(selected).then(|| s.oversampling[selected.index()]),
             status: m.status(),
             meters: m.meters(),
             latency: s.latency_samples(),
@@ -99,6 +102,20 @@ fn module_editor(app: &mut MasteringApp, ui: &mut egui::Ui, vm: &ViewModel, mete
         let label = if auto { format!("Auto gain-match ({:+.1} dB)", vm.auto_gain_db) } else { "Auto gain-match".to_string() };
         if ui.toggle_value(&mut auto, label).on_hover_text("Trim this module's output so it changes tone, not level").changed() {
             app.edit_suite(&format!("{}/auto", kind.key()), move |s| s.set_auto_gain(kind, auto));
+        }
+        if let Some(current) = vm.oversampling {
+            let label = |f: usize| if f == 1 { "Oversampling: off".to_string() } else { format!("Oversampling: {}x", f) };
+            let mut chosen = current;
+            egui::ComboBox::from_id_salt("oversampling").selected_text(label(current)).show_ui(ui, |ui| {
+                for f in [1usize, 2, 4] {
+                    ui.selectable_value(&mut chosen, f, label(f));
+                }
+            })
+            .response
+            .on_hover_text("Run this module at a higher rate so its distortion doesn't alias (adds a little latency)");
+            if chosen != current {
+                app.edit_suite(&format!("{}/oversampling", kind.key()), move |s| s.set_oversampling(kind, chosen));
+            }
         }
         if kind == ModuleKind::MatchEq && ui.button("Learn from reference track").clicked() {
             app.learn_match_eq();

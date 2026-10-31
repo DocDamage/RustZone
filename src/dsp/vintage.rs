@@ -52,6 +52,7 @@ impl VintageCompressor {
 }
 
 impl Module for VintageCompressor {
+    fn oversampling_default(&self) -> usize { 2 }
     fn enabled(&self) -> bool { self.enabled }
     fn set_enabled(&mut self, e: bool) { self.enabled = e; }
     fn params(&self) -> Vec<ParamInfo> {
@@ -219,6 +220,7 @@ impl PassiveEq {
 }
 
 impl Module for PassiveEq {
+    fn oversampling_default(&self) -> usize { 2 }
     fn enabled(&self) -> bool { self.enabled }
     fn set_enabled(&mut self, e: bool) { self.enabled = e; }
     fn params(&self) -> Vec<ParamInfo> {
@@ -321,6 +323,10 @@ impl OptoLimiter {
 }
 
 impl Module for OptoLimiter {
+    fn output_ceiling(&self) -> Option<f32> {
+        Some(db_to_gain(self.ceiling_db))
+    }
+    fn oversampling_default(&self) -> usize { 2 }
     fn enabled(&self) -> bool { self.enabled }
     fn set_enabled(&mut self, e: bool) { self.enabled = e; }
     fn params(&self) -> Vec<ParamInfo> {
@@ -443,6 +449,7 @@ impl TapeSaturation {
 }
 
 impl Module for TapeSaturation {
+    fn oversampling_default(&self) -> usize { 2 }
     fn enabled(&self) -> bool { self.enabled }
     fn set_enabled(&mut self, e: bool) { self.enabled = e; }
     fn params(&self) -> Vec<ParamInfo> {

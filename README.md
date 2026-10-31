@@ -36,6 +36,10 @@ A chain of 19 modules. Each one can be switched on or off independently, and the
 
 **AI stem separation.** Stem Rebalance and Stem EQ start as real-time approximations (spectral stem masks). Click **Separate stems (AI)** in either module and the bundled HTDemucs model splits the track into drums, bass, other and vocals in the background (on a CPU it takes about as long as the track plays). From then on both modules work on the real stems, during playback and export, with no added latency. The stem mixer's Auto-Separate uses the same model. See [`models/README.md`](models/README.md) for the model's origin and licence.
 
+**Oversampling.** Modules that generate harmonics (Exciter, Tape, Vintage Compressor, Opto Limiter, Bass Enhancer, Passive EQ) run at 2x by default, and every such module (plus the Maximizer) can be set to off, 2x or 4x in its header. Linear-phase half-band filters remove the harmonics that would otherwise alias back into the audible band. On a hard-clipped 9.7 kHz tone, aliases drop from −14 dB to −73 dB. Oversampling adds 24 samples (2x) or 36 samples (4x) of latency, which is compensated like everything else.
+
+**Phase-coherent multiband.** Multiband Dynamics, the Multiband Transient Shaper and the Stereo Imager split with Linkwitz-Riley crossovers whose bands are all-pass compensated, so with neutral settings they sum flat (within ±0.001 dB).
+
 All DSP modules are original implementations. The spectral modules (Match EQ, Stem EQ, Stem Rebalance, Spectral Shaper, Tonal Stabilizer) share one streaming FFT engine (2048-point, 75% overlap) that reconstructs the signal exactly at neutral settings. Each adds 2048 samples of latency while enabled. The total is shown in the editor and compensated on export.
 
 ### Honest comparisons
@@ -122,7 +126,21 @@ Pass an audio file path as the first argument to open it on launch. `--screensho
 cargo test -- --test-threads=1
 ```
 
+Highlights: golden-audio regression tests (`tests/golden/`; re-record after an intended change with `UPDATE_GOLDEN=1 cargo test --test golden_test`), aliasing and latency checks for oversampling, and flatness checks for the crossovers.
+
 The fallback-plugin tests only run when `MASTERING_STUDIO_TEST_VST3` points at a `.vst3` file (e.g. any installed third-party plugin); otherwise they skip. `engine_realtime_test` needs an audio output device, and `ml_separation_test` needs the model file.
+
+### Benchmark
+
+```powershell
+cargo run --release --example bench_modules
+```
+
+This prints each module's CPU load at 48 kHz stereo. Every module runs far faster than real time; the default chain uses about 1.3% of one core, and all 19 modules together about 12%.
+
+### Continuous integration
+
+GitHub Actions (`.github/workflows/ci.yml`) builds, runs clippy with warnings as errors, runs the tests and prints the benchmark on Windows for every push and pull request. Runners have no audio device and skip the LFS model, so those tests skip themselves.
 
 ### Real-time design
 
@@ -139,6 +157,7 @@ src/
 ├── dsp/
 │   ├── module.rs        Module trait, parameter descriptions, module registry
 │   ├── stft.rs          Streaming STFT shared by the spectral modules
+│   ├── oversampling.rs  2x / 4x linear-phase oversampler
 │   ├── core_modules.rs  Module impls for EQ, dynamics, imager, exciter, clarity, maximizer
 │   ├── spectral.rs      Match EQ, Spectral Shaper, Tonal Stabilizer, Stem Rebalance, Stem EQ
 │   ├── transient.rs     Low-End Shaper, Multiband Transient Shaper, Transient Restore, Bass Enhancer
@@ -159,5 +178,9 @@ tests/
 ├── module_suite_test.rs      behaviour of the suite's modules
 ├── engine_realtime_test.rs   command queue, A/B match, auto gain, device switching
 ├── session_test.rs           undo/redo, snapshots, session round trip
+├── oversampling_test.rs      transparency, latency, alias reduction
+├── crossover_test.rs         multiband bands sum flat
+├── golden_test.rs            output must match tests/golden/
 └── ml_separation_test.rs     trained stem separation and rebalance on stems
+examples/bench_modules.rs     per-module CPU benchmark
 ```

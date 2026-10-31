@@ -69,7 +69,7 @@ impl Vst3Plugin {
         let gpf_name = CString::new("GetPluginFactory").unwrap();
         let gpf_addr = unsafe { GetProcAddress(hmodule, windows::core::PCSTR(gpf_name.as_ptr() as *const u8)) };
         let gpf_fn: unsafe extern "system" fn() -> *mut c_void = match gpf_addr {
-            Some(func) => unsafe { std::mem::transmute(func) },
+            Some(func) => unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, unsafe extern "system" fn() -> *mut c_void>(func) },
             None => {
                 unsafe { let _ = FreeLibrary(hmodule); }
                 return Err("GetPluginFactory export not found in VST3".to_string());
@@ -102,17 +102,15 @@ impl Vst3Plugin {
                 let cat = unsafe { CStr::from_ptr(info.category.as_ptr()) }.to_string_lossy();
                 let name = unsafe { CStr::from_ptr(info.name.as_ptr()) }.to_string_lossy();
 
-                if cat.contains("Audio Module Class") || cat.contains("Component") || i == 0 {
-                    if comp_cid.is_none() {
+                if (cat.contains("Audio Module Class") || cat.contains("Component") || i == 0)
+                    && comp_cid.is_none() {
                         comp_cid = Some(info.cid);
                         plugin_name = name.to_string();
                     }
-                }
-                if cat.contains("Component Controller Class") || cat.contains("Controller") {
-                    if ctrl_cid.is_none() {
+                if (cat.contains("Component Controller Class") || cat.contains("Controller"))
+                    && ctrl_cid.is_none() {
                         ctrl_cid = Some(info.cid);
                     }
-                }
             }
         }
 
@@ -375,7 +373,7 @@ impl Vst3Plugin {
 
         // Attach view to parent HWND container
         let r_attach = unsafe {
-            (view_vtbl.attached)(view_ptr, parent_hwnd.0 as *mut c_void, platform_hwnd.as_ptr())
+            (view_vtbl.attached)(view_ptr, parent_hwnd.0, platform_hwnd.as_ptr())
         };
         if r_attach != K_RESULT_OK {
             return Err(format!("IPlugView::attached failed with code 0x{:08X}", r_attach));

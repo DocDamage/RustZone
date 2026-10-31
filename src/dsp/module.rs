@@ -115,6 +115,15 @@ pub trait Module {
     }
     /// Receive published live values on the UI's copy, so `status` reads them
     fn set_meters(&mut self, _meters: [f32; 4]) {}
+    /// Default oversampling factor for modules whose nonlinearities alias (0 = not offered)
+    fn oversampling_default(&self) -> usize {
+        0
+    }
+    /// Hard output ceiling (linear) that must hold at the suite rate. When the module is
+    /// oversampled, the downsampling filter can overshoot it, so the suite re-applies it.
+    fn output_ceiling(&self) -> Option<f32> {
+        None
+    }
 }
 
 macro_rules! module_kinds {

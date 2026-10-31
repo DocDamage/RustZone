@@ -10,6 +10,7 @@ pub mod preset_parser;
 pub mod assistant;
 pub mod module;
 pub mod stft;
+pub mod oversampling;
 pub mod spectral;
 pub mod transient;
 pub mod vintage;
@@ -193,7 +194,7 @@ pub struct MasteringImager {
     /// Adds decorrelated width to narrow material (0..1)
     pub stereoize: f32,
     mono_filter: BiquadFilter,
-    splits: [multiband::LinkwitzRiley4; 3],
+    splits: multiband::Crossover4,
     stereoize_hp: BiquadFilter,
     delay: Vec<f32>,
     delay_pos: usize,
@@ -211,7 +212,7 @@ impl MasteringImager {
             band_width: [1.0; 4],
             stereoize: 0.0,
             mono_filter: BiquadFilter::new(FilterType::HighPass, 120.0, 0.707, 0.0, sample_rate),
-            splits: [multiband::LinkwitzRiley4::new(200.0, sample_rate); 3],
+            splits: multiband::Crossover4::new(IMAGER_CROSSOVERS, sample_rate),
             stereoize_hp: BiquadFilter::new(FilterType::HighPass, 300.0, 0.707, 0.0, sample_rate),
             delay: Vec::new(),
             delay_pos: 0,
@@ -225,9 +226,7 @@ impl MasteringImager {
         self.sample_rate = sample_rate;
         self.mono_filter.set_sample_rate(sample_rate);
         self.stereoize_hp.set_sample_rate(sample_rate);
-        for (s, f) in self.splits.iter_mut().zip(IMAGER_CROSSOVERS) {
-            *s = multiband::LinkwitzRiley4::new(f, sample_rate);
-        }
+        self.splits = multiband::Crossover4::new(IMAGER_CROSSOVERS, sample_rate);
         // ~12 ms decorrelation delay for Stereoize
         self.delay = vec![0.0; ((sample_rate * 0.012) as usize).max(1)];
         self.delay_pos = 0;
@@ -236,9 +235,7 @@ impl MasteringImager {
     pub fn reset_state(&mut self) {
         self.mono_filter.reset_state();
         self.stereoize_hp.reset_state();
-        for s in self.splits.iter_mut() {
-            s.reset();
-        }
+        self.splits.reset();
         self.delay.fill(0.0);
     }
 
@@ -264,9 +261,7 @@ impl MasteringImager {
             // Force sub-bass to 100% mono
             let (filtered_side, _) = self.mono_filter.process_sample(raw_side, raw_side);
             let mut out_side = if multiband {
-                let (b0, rest) = self.splits[0].split(filtered_side, 0.0);
-                let (b1, rest) = self.splits[1].split(rest.0, 0.0);
-                let (b2, b3) = self.splits[2].split(rest.0, 0.0);
+                let [b0, b1, b2, b3] = self.splits.split(filtered_side, 0.0);
                 b0.0 * self.band_width[0] + b1.0 * self.band_width[1] + b2.0 * self.band_width[2] + b3.0 * self.band_width[3]
             } else {
                 filtered_side
@@ -468,6 +463,9 @@ pub struct MasteringSuite {
     pub chain: Vec<ModuleKind>,
     /// Per-module auto gain-match switches, indexed by `ModuleKind::index`
     pub auto_gain: [bool; ModuleKind::COUNT],
+    /// Oversampling factor per module (1 = off), indexed by `ModuleKind::index`
+    pub oversampling: [usize; ModuleKind::COUNT],
+    oversamplers: Vec<oversampling::Oversampler>,
     /// Set by the host while separated stems are being mixed in front of the chain (applying
     /// Stem Rebalance / Stem EQ to the real stems), so the real-time approximations step aside
     pub external_stems: bool,
@@ -479,7 +477,7 @@ pub struct MasteringSuite {
 
 impl MasteringSuite {
     pub fn new(sample_rate: f32) -> Self {
-        Self {
+        let mut suite = Self {
             dynamic_eq: DynamicEqualizer::new(sample_rate),
             passive_eq: PassiveEq::new(sample_rate),
             match_eq: MatchEq::new(sample_rate),
@@ -501,12 +499,19 @@ impl MasteringSuite {
             maximizer: MasteringMaximizer::new(sample_rate),
             chain: DEFAULT_CHAIN.to_vec(),
             auto_gain: [false; ModuleKind::COUNT],
+            oversampling: [1; ModuleKind::COUNT],
+            oversamplers: (0..ModuleKind::COUNT).map(|_| oversampling::Oversampler::new(1)).collect(),
             external_stems: false,
             auto_gain_state: vec![AutoGain::new(sample_rate); ModuleKind::COUNT],
             lufs_meter: EbuR128Meter::new(sample_rate),
             spectral_analyzer: SpectralAnalyzer::new(sample_rate),
             sample_rate,
+        };
+        for &kind in ModuleKind::ALL {
+            let factor = suite.module(kind).oversampling_default().max(1);
+            suite.set_oversampling(kind, factor);
         }
+        suite
     }
 
     pub fn module(&self, kind: ModuleKind) -> &dyn Module {
@@ -557,6 +562,28 @@ impl MasteringSuite {
         }
     }
 
+    /// Whether a module offers oversampling
+    pub fn supports_oversampling(&self, kind: ModuleKind) -> bool {
+        self.module(kind).oversampling_default() > 0
+    }
+
+    /// Run a module at 1x, 2x or 4x the suite rate (ignored for modules that don't offer it)
+    pub fn set_oversampling(&mut self, kind: ModuleKind, factor: usize) {
+        let factor = match factor {
+            2 => 2,
+            f if f >= 4 => 4,
+            _ => 1,
+        };
+        if !self.supports_oversampling(kind) && factor > 1 {
+            return;
+        }
+        let idx = kind.index();
+        let sr = self.sample_rate;
+        self.oversampling[idx] = factor;
+        self.oversamplers[idx] = oversampling::Oversampler::new(factor);
+        self.module_mut(kind).set_sample_rate(sr * factor as f32);
+    }
+
     /// Switch a module's auto gain-match on or off (restarting its measurement)
     pub fn set_auto_gain(&mut self, kind: ModuleKind, on: bool) {
         let idx = kind.index();
@@ -597,7 +624,11 @@ impl MasteringSuite {
     pub fn set_sample_rate(&mut self, sample_rate: f32) {
         self.sample_rate = sample_rate;
         for &kind in ModuleKind::ALL {
-            self.module_mut(kind).set_sample_rate(sample_rate);
+            let factor = self.oversampling[kind.index()];
+            self.module_mut(kind).set_sample_rate(sample_rate * factor as f32);
+        }
+        for os in self.oversamplers.iter_mut() {
+            os.reset();
         }
         for ag in self.auto_gain_state.iter_mut() {
             ag.set_sample_rate(sample_rate);
@@ -609,6 +640,9 @@ impl MasteringSuite {
     pub fn reset_state(&mut self) {
         for &kind in ModuleKind::ALL {
             self.module_mut(kind).reset();
+        }
+        for os in self.oversamplers.iter_mut() {
+            os.reset();
         }
         for ag in self.auto_gain_state.iter_mut() {
             ag.reset();
@@ -622,9 +656,12 @@ impl MasteringSuite {
         self.chain
             .iter()
             .filter(|&&k| !(self.external_stems && Self::is_stem_module(k)))
-            .map(|&k| self.module(k))
-            .filter(|m| m.enabled())
-            .map(|m| m.latency())
+            .filter(|&&k| self.module(k).enabled())
+            .map(|&k| {
+                // A module's own latency is counted at its (possibly oversampled) rate
+                let factor = self.oversampling[k.index()];
+                self.module(k).latency() / factor + self.oversamplers[k.index()].latency()
+            })
             .sum()
     }
 
@@ -650,7 +687,21 @@ impl MasteringSuite {
             if auto {
                 self.auto_gain_state[idx].pre.feed(left, right);
             }
-            self.module_mut(kind).process(left, right);
+            if self.oversampling[idx] > 1 {
+                // Borrow the oversampler out (an empty 1x one allocates nothing) so the closure
+                // can borrow the module
+                let mut os = std::mem::replace(&mut self.oversamplers[idx], oversampling::Oversampler::new(1));
+                os.process(left, right, &mut |l, r| self.module_mut(kind).process(l, r));
+                self.oversamplers[idx] = os;
+                // Filter ringing from downsampling can poke past a limiter's ceiling
+                if let Some(ceiling) = self.module(kind).output_ceiling() {
+                    for v in left.iter_mut().chain(right.iter_mut()) {
+                        *v = v.clamp(-ceiling, ceiling);
+                    }
+                }
+            } else {
+                self.module_mut(kind).process(left, right);
+            }
             if auto {
                 let ag = &mut self.auto_gain_state[idx];
                 ag.post.feed(left, right);

@@ -283,9 +283,7 @@ impl StemSeparator {
                 let k_end = (k + kappa + 1).min(num_bins);
                 let mut temp = [0.0f32; 9];
                 let count = k_end - k_start;
-                for idx in 0..count {
-                    temp[idx] = mag_spec[m][k_start + idx];
-                }
+                temp[..count].copy_from_slice(&mag_spec[m][k_start..k_end]);
                 p_spec[m][k] = fast_median_7(&temp[..count]);
             }
         }
@@ -365,11 +363,11 @@ impl StemSeparator {
                 let raw_bass = w_harm * coh * bass_freq_gate * 1.5;
 
                 // 3. Vocals (Mid-centered harmonic formants between 150 Hz and 4500 Hz)
-                let vocal_freq_gate = if f_hz >= 180.0 && f_hz <= 4200.0 {
+                let vocal_freq_gate = if (180.0..=4200.0).contains(&f_hz) {
                     1.0
                 } else if f_hz > 4200.0 && f_hz < 5500.0 {
                     (5500.0 - f_hz) / 1300.0
-                } else if f_hz >= 120.0 && f_hz < 180.0 {
+                } else if (120.0..180.0).contains(&f_hz) {
                     (f_hz - 120.0) / 60.0
                 } else {
                     0.0
@@ -377,7 +375,7 @@ impl StemSeparator {
                 let raw_vocals = w_harm * coh.powf(1.8) * vocal_freq_gate * 1.4;
 
                 // 4. Instruments (Harmonic Guitars & Keys: mid-range harmonic, non-center or acoustic)
-                let inst_freq_gate = if f_hz >= 220.0 && f_hz <= 6500.0 {
+                let inst_freq_gate = if (220.0..=6500.0).contains(&f_hz) {
                     1.0
                 } else if f_hz > 6500.0 && f_hz < 8000.0 {
                     (8000.0 - f_hz) / 1500.0

@@ -62,7 +62,10 @@ pub fn find_model() -> Option<PathBuf> {
             candidates.push(dir.join("models").join(MODEL_FILE));
         }
     }
-    candidates.into_iter().find(|p| p.is_file())
+    // A checkout without Git LFS has a tiny text pointer instead of the model; ignore it
+    candidates
+        .into_iter()
+        .find(|p| std::fs::metadata(p).map(|m| m.is_file() && m.len() > 1_000_000).unwrap_or(false))
 }
 
 pub struct DemucsSeparator {
@@ -239,7 +242,7 @@ impl StftCore {
     /// drop the Nyquist bin and the two edge frames on each side. Returns BINS x FRAMES (re, im).
     fn spec(&self, x: &[f32]) -> (Vec<f32>, Vec<f32>) {
         let len = x.len();
-        let le = (len + HOP - 1) / HOP;
+        let le = len.div_ceil(HOP);
         let pad = HOP / 2 * 3;
         let padded = reflect_pad(x, pad, pad + le * HOP - len);
         let centred = reflect_pad(&padded, NFFT / 2, NFFT / 2);
@@ -270,7 +273,7 @@ impl StftCore {
     fn ispec(&self, z_re: &[f32], z_im: &[f32]) -> Vec<f32> {
         let frames = FRAMES + 4;
         let pad = HOP / 2 * 3;
-        let le = HOP * ((SEGMENT + HOP - 1) / HOP) + 2 * pad;
+        let le = HOP * SEGMENT.div_ceil(HOP) + 2 * pad;
         let total = NFFT + HOP * (frames - 1);
         let mut acc = vec![0.0f32; total];
         let mut env = vec![0.0f32; total];

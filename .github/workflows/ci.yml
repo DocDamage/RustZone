@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      # The 174 MB stem model is in Git LFS; CI skips the model test instead of using LFS bandwidth
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --all-targets --locked
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      # Runners have no audio device: device tests skip themselves
+      - name: Test
+        run: cargo test --locked -- --test-threads=1
+
+      - name: Module benchmark
+        run: cargo run --release --locked --example bench_modules

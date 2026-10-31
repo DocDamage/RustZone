@@ -10,6 +10,7 @@ const CHAIN_ELEMENT: &str = "chain";
 const MATCH_ELEMENT: &str = "match_eq_learned";
 const ENABLED_PARAM: &str = "Enabled";
 const AUTO_GAIN_PARAM: &str = "Auto gain";
+const OVERSAMPLING_PARAM: &str = "Oversampling";
 
 /// An XML preset: the app's own module presets, or factory presets in the element/param layout
 #[derive(Clone, Debug, Default)]
@@ -136,6 +137,9 @@ impl XmlPreset {
             let module = suite.module(kind);
             preset.params.insert(format!("{}::{}", kind.key(), ENABLED_PARAM), flag(module.enabled()));
             preset.params.insert(format!("{}::{}", kind.key(), AUTO_GAIN_PARAM), flag(suite.auto_gain[kind.index()]));
+            if suite.supports_oversampling(kind) {
+                preset.params.insert(format!("{}::{}", kind.key(), OVERSAMPLING_PARAM), suite.oversampling[kind.index()] as f32);
+            }
             for (i, info) in module.params().iter().enumerate() {
                 preset.params.insert(format!("{}::{}", kind.key(), info.name), module.get_param(i));
             }
@@ -204,6 +208,11 @@ impl XmlPreset {
         for &kind in ModuleKind::ALL {
             if let Some(&ag) = self.get_param(kind.key(), AUTO_GAIN_PARAM) {
                 suite.set_auto_gain(kind, ag > 0.5);
+            }
+            if let Some(&os) = self.get_param(kind.key(), OVERSAMPLING_PARAM) {
+                if os as usize != suite.oversampling[kind.index()] {
+                    suite.set_oversampling(kind, os as usize);
+                }
             }
             let infos = suite.module(kind).params();
             let module = suite.module_mut(kind);

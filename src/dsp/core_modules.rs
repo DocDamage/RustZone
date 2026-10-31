@@ -168,6 +168,7 @@ impl Module for MasteringImager {
 }
 
 impl Module for MasteringExciter {
+    fn oversampling_default(&self) -> usize { 2 }
     fn enabled(&self) -> bool { self.enabled }
     fn set_enabled(&mut self, e: bool) { self.enabled = e; }
     fn params(&self) -> Vec<ParamInfo> {
@@ -214,6 +215,10 @@ impl Module for SpectralClarity {
 }
 
 impl Module for MasteringMaximizer {
+    fn output_ceiling(&self) -> Option<f32> {
+        Some(10.0f32.powf(self.ceiling_db / 20.0))
+    }
+    fn oversampling_default(&self) -> usize { 1 }
     fn enabled(&self) -> bool { self.enabled }
     fn set_enabled(&mut self, e: bool) { self.enabled = e; }
     fn params(&self) -> Vec<ParamInfo> {

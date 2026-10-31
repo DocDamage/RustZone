@@ -19,7 +19,7 @@ impl Biquad {
         let w0 = 2.0 * PI * fc / fs;
         let cos_w = w0.cos();
         let sin_w = w0.sin();
-        let alpha = sin_w / (2.0 * 0.70710678); // Butterworth Q = 1/sqrt(2)
+        let alpha = sin_w / (2.0 * std::f32::consts::FRAC_1_SQRT_2); // Butterworth Q = 1/sqrt(2)
 
         let b0 = (1.0 - cos_w) * 0.5;
         let b1 = 1.0 - cos_w;
@@ -46,7 +46,7 @@ impl Biquad {
         let w0 = 2.0 * PI * fc / fs;
         let cos_w = w0.cos();
         let sin_w = w0.sin();
-        let alpha = sin_w / (2.0 * 0.70710678);
+        let alpha = sin_w / (2.0 * std::f32::consts::FRAC_1_SQRT_2);
 
         let b0 = (1.0 + cos_w) * 0.5;
         let b1 = -(1.0 + cos_w);
@@ -128,6 +128,55 @@ impl LinkwitzRiley4 {
     }
 }
 
+/// Four-band Linkwitz-Riley crossover whose bands always sum to a flat (all-pass) response.
+///
+/// Bands are split off one crossover at a time; a band split off early never passes through the
+/// later crossovers, so it is sent through their all-pass equivalents (LR4 low + high) to keep
+/// every band in phase.
+#[derive(Clone, Copy, Debug)]
+pub struct Crossover4 {
+    splits: [LinkwitzRiley4; 3],
+    /// Band 0 compensation for crossovers 2 and 3, band 1 for crossover 3
+    comp0: [LinkwitzRiley4; 2],
+    comp1: LinkwitzRiley4,
+}
+
+impl Crossover4 {
+    pub fn new(freqs: [f32; 3], sample_rate: f32) -> Self {
+        let lr = |f: f32| LinkwitzRiley4::new(f, sample_rate);
+        Self {
+            splits: [lr(freqs[0]), lr(freqs[1]), lr(freqs[2])],
+            comp0: [lr(freqs[1]), lr(freqs[2])],
+            comp1: lr(freqs[2]),
+        }
+    }
+
+    pub fn reset(&mut self) {
+        for x in self.splits.iter_mut().chain(self.comp0.iter_mut()) {
+            x.reset();
+        }
+        self.comp1.reset();
+    }
+
+    #[inline]
+    fn allpass(lr: &mut LinkwitzRiley4, (l, r): (f32, f32)) -> (f32, f32) {
+        let (lo, hi) = lr.split(l, r);
+        (lo.0 + hi.0, lo.1 + hi.1)
+    }
+
+    /// Low to high bands of one stereo sample
+    #[inline]
+    pub fn split(&mut self, l: f32, r: f32) -> [(f32, f32); 4] {
+        let (b0, rest) = self.splits[0].split(l, r);
+        let (b1, rest) = self.splits[1].split(rest.0, rest.1);
+        let (b2, b3) = self.splits[2].split(rest.0, rest.1);
+        let b0 = Self::allpass(&mut self.comp0[0], b0);
+        let b0 = Self::allpass(&mut self.comp0[1], b0);
+        let b1 = Self::allpass(&mut self.comp1, b1);
+        [b0, b1, b2, b3]
+    }
+}
+
 /// Mastering Dynamic Compressor / Expander Band
 #[derive(Clone, Debug)]
 pub struct DynamicsBand {
@@ -196,11 +245,11 @@ impl DynamicsBand {
 pub struct MultibandDynamics {
     pub enabled: bool,
     sample_rate: f32,
-    crossover_low: LinkwitzRiley4,
-    crossover_mid: LinkwitzRiley4,
-    crossover_high: LinkwitzRiley4,
+    crossover: Crossover4,
     pub bands: [DynamicsBand; 4],
 }
+
+const DYNAMICS_CROSSOVERS: [f32; 3] = [140.0, 1500.0, 6000.0];
 
 impl MultibandDynamics {
     pub fn new(sample_rate: f32) -> Self {
@@ -208,9 +257,7 @@ impl MultibandDynamics {
         Self {
             enabled: true,
             sample_rate: sr,
-            crossover_low: LinkwitzRiley4::new(140.0, sr),
-            crossover_mid: LinkwitzRiley4::new(1500.0, sr),
-            crossover_high: LinkwitzRiley4::new(6000.0, sr),
+            crossover: Crossover4::new(DYNAMICS_CROSSOVERS, sr),
             bands: [
                 // Low Band (20 - 140 Hz)
                 DynamicsBand::new(-16.0, 2.0, 25.0, 120.0, 0.4),
@@ -227,16 +274,12 @@ impl MultibandDynamics {
     pub fn set_sample_rate(&mut self, sample_rate: f32) {
         let sr = sample_rate.max(8000.0);
         self.sample_rate = sr;
-        self.crossover_low = LinkwitzRiley4::new(140.0, sr);
-        self.crossover_mid = LinkwitzRiley4::new(1500.0, sr);
-        self.crossover_high = LinkwitzRiley4::new(6000.0, sr);
+        self.crossover = Crossover4::new(DYNAMICS_CROSSOVERS, sr);
         self.reset();
     }
 
     pub fn reset(&mut self) {
-        self.crossover_low.reset();
-        self.crossover_mid.reset();
-        self.crossover_high.reset();
+        self.crossover.reset();
         for b in &mut self.bands {
             b.reset();
         }
@@ -254,22 +297,14 @@ impl MultibandDynamics {
             let in_l = left[i];
             let in_r = right[i];
 
-            // 1. Split into Low (<140Hz) and MidHigh (>140Hz)
-            let (b0_low, mid_high) = self.crossover_low.split(in_l, in_r);
+            // Low (<140 Hz), low-mid (<1.5 kHz), high-mid (<6 kHz), air
+            let [b0, b1, b2, b3] = self.crossover.split(in_l, in_r);
+            let out_b0 = self.bands[0].process(b0.0, b0.1, sr);
+            let out_b1 = self.bands[1].process(b1.0, b1.1, sr);
+            let out_b2 = self.bands[2].process(b2.0, b2.1, sr);
+            let out_b3 = self.bands[3].process(b3.0, b3.1, sr);
 
-            // 2. Split MidHigh into LowMid (<1.5kHz) and High (>1.5kHz)
-            let (b1_low_mid, high_split) = self.crossover_mid.split(mid_high.0, mid_high.1);
-
-            // 3. Split High into HighMid (<6kHz) and Air (>6kHz)
-            let (b2_high_mid, b3_air) = self.crossover_high.split(high_split.0, high_split.1);
-
-            // 4. Process each band independently
-            let out_b0 = self.bands[0].process(b0_low.0, b0_low.1, sr);
-            let out_b1 = self.bands[1].process(b1_low_mid.0, b1_low_mid.1, sr);
-            let out_b2 = self.bands[2].process(b2_high_mid.0, b2_high_mid.1, sr);
-            let out_b3 = self.bands[3].process(b3_air.0, b3_air.1, sr);
-
-            // 5. Phase-coherent sum back into stereo master
+            // Phase-coherent sum back into stereo
             left[i] = out_b0.0 + out_b1.0 + out_b2.0 + out_b3.0;
             right[i] = out_b0.1 + out_b1.1 + out_b2.1 + out_b3.1;
         }
