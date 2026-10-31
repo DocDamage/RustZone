@@ -69,3 +69,16 @@ The last 4096 bytes of `fixture.bin` are `tests/fixtures/afx_rep_demo_embedding.
 ### Licence (AFx-Rep)
 
 Apache License 2.0: <https://www.apache.org/licenses/LICENSE-2.0>
+
+## Text model (not bundled)
+
+**Describe (AI)** uses a small language model that the app downloads on first use, after you
+click **Download text model**, to `%LOCALAPPDATA%\MasteringStudio\models`. It's also found here
+in `models/`, where Git ignores it.
+
+- **Model:** Qwen2.5-1.5B-Instruct by Alibaba Cloud (Apache-2.0),
+  <https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF>, revision
+  `91cad51170dc346986eccefdc2dd33a9da36ead9`.
+- **File:** `qwen2.5-1.5b-instruct-q4_k_m.gguf`, 1,117,320,736 bytes.
+- **SHA-256:** `6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e`, checked
+  before the download takes the model's name.

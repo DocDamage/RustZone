@@ -26,6 +26,10 @@ png = "0.17"
 flacenc = { version = "0.5", default-features = false, features = ["par"] }
 # ONNX Runtime for the bundled HTDemucs stem-separation model
 ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "download-binaries"] }
+# llama.cpp and the first-use download for the text-request model
+llama-cpp-2 = { version = "=0.1.160", default-features = false }
+ureq = "2"
+sha2 = "0.11"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

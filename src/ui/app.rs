@@ -16,12 +16,13 @@ use super::{discover_vst3_plugins, save_png, LaunchOptions, AUDIO_EXTENSIONS, EX
 use crate::audio::{
     list_audio_hosts, list_output_devices, load_audio_file, render_to_buffer, render_to_file, AudioBuffer, AudioEngine, BwfMetadata,
     CodecPreview, DeviceChoice, FadeShape, OutputDeviceInfo, PreviewMode, ProcessingMode, QcReport, QcTargets, RenderOptions,
-    RenderSource, StyleModel,
+    RenderSource, StyleModel, TextModel,
 };
 use crate::dsp::style_match::CANCELLED;
+use crate::dsp::text_edit::MAX_TOKENS;
 use crate::dsp::{
-    calculate_buffer_integrated_lufs, match_to_reference, MasterAssistantReport, MasteringSuite, MatchOptions, MatchResult, ModuleKind,
-    XmlPreset, GENRES,
+    calculate_buffer_integrated_lufs, match_to_reference, plan_request, MasterAssistantReport, MasteringSuite, MatchOptions, MatchResult,
+    ModuleKind, TextPlan, XmlPreset, GENRES,
 };
 use crate::midi::{MidiController, MidiEvent};
 use crate::session::{History, Session, SessionUiState, Snapshots, SESSION_EXTENSION, SLOT_NAMES};
@@ -61,6 +62,7 @@ impl Status {
 }
 
 type StyleOutcome = (Arc<AudioBuffer>, Result<MatchResult, String>);
+type TextOutcome = (Arc<AudioBuffer>, Result<TextPlan, String>);
 
 /// Device dialog state
 pub(super) struct DeviceDialog {
@@ -110,6 +112,15 @@ pub struct MasteringApp {
     /// Finished reference match and the track it was made for, waiting for the UI thread
     style_result: Arc<Mutex<Option<StyleOutcome>>>,
     style_report: Option<String>,
+    /// What the user typed for the text model
+    text_request: String,
+    text_model_found: Arc<AtomicBool>,
+    /// A text-model download or request is running
+    text_running: Arc<AtomicBool>,
+    text_cancel: Arc<AtomicBool>,
+    /// Finished text request and the track it was made for, waiting for the UI thread
+    text_result: Arc<Mutex<Option<TextOutcome>>>,
+    text_report: Option<String>,
     /// Latest export QC report, set by the export job
     pub(super) qc_report: Arc<Mutex<Option<String>>>,
     /// Chain settings the loaded codec preview was rendered with (to flag it as out of date)
@@ -178,6 +189,12 @@ impl MasteringApp {
             style_cancel: Arc::new(AtomicBool::new(false)),
             style_result: Arc::new(Mutex::new(None)),
             style_report: None,
+            text_request: String::new(),
+            text_model_found: Arc::new(AtomicBool::new(crate::audio::ml_text::find_model().is_some())),
+            text_running: Arc::new(AtomicBool::new(false)),
+            text_cancel: Arc::new(AtomicBool::new(false)),
+            text_result: Arc::new(Mutex::new(None)),
+            text_report: None,
             qc_report: Arc::new(Mutex::new(None)),
             preview_fingerprint: None,
             screenshot: options.screenshot.map(|p| (p, 0)),
@@ -554,6 +571,79 @@ impl MasteringApp {
             Ok(_) => self.status.set("Match reference: the current settings were already the closest found"),
             Err(e) if e == CANCELLED => self.status.set("Match reference cancelled; nothing changed"),
             Err(e) => self.status.set(format!("Match reference: {}", e)),
+        }
+    }
+
+    /// Fetch the text model in the background
+    fn download_text_model(&mut self) {
+        let running = Arc::clone(&self.text_running);
+        let cancel = Arc::clone(&self.text_cancel);
+        let found = Arc::clone(&self.text_model_found);
+        let ctx = self.ctx.clone();
+        self.spawn_job(move |_, status| {
+            running.store(true, Ordering::Release);
+            cancel.store(false, Ordering::Release);
+            let result = crate::audio::ml_text::download_model(&cancel, |p| {
+                status.set(format!("Downloading the text model: {:.0}%", p * 100.0));
+                ctx.request_repaint();
+            });
+            match result {
+                Ok(_) => {
+                    found.store(true, Ordering::Release);
+                    status.set("Text model ready");
+                }
+                Err(e) if e == CANCELLED => status.set("Text model download cancelled"),
+                Err(e) => status.set(format!("Text model: {}", e)),
+            }
+            running.store(false, Ordering::Release);
+        });
+    }
+
+    /// Ask the text model for small moves in the background; `apply_text_request` makes them
+    fn run_text_request(&mut self) {
+        let Some(track) = self.engine.audio_buffer() else {
+            self.status.set("Load a track first");
+            return;
+        };
+        let request = self.text_request.clone();
+        let target_lufs = TARGETS[self.target].target_lufs;
+        let running = Arc::clone(&self.text_running);
+        let cancel = Arc::clone(&self.text_cancel);
+        let out = Arc::clone(&self.text_result);
+        let ctx = self.ctx.clone();
+        self.spawn_job(move |engine, status| {
+            running.store(true, Ordering::Release);
+            cancel.store(false, Ordering::Release);
+            status.set("Text request: loading the model…");
+            ctx.request_repaint();
+            let suite = engine.dsp_suite_snapshot();
+            let result = TextModel::load_default().and_then(|model| {
+                plan_request(&track, &suite, &request, target_lufs, |chat, grammar| {
+                    status.set("Text request: thinking…");
+                    ctx.request_repaint();
+                    model.generate(chat, grammar, MAX_TOKENS, &cancel)
+                })
+            });
+            *out.lock() = Some((track, result));
+            running.store(false, Ordering::Release);
+        });
+    }
+
+    fn apply_text_request(&mut self) {
+        let Some((track, result)) = self.text_result.lock().take() else { return };
+        let same_track = self.engine.audio_buffer().is_some_and(|b| Arc::ptr_eq(&b, &track));
+        match result {
+            Ok(_) if !same_track => self.status.set("Text request: the track changed, so the result was dropped"),
+            Ok(plan) if plan.edits.is_empty() => self.status.set("Text request: the model suggested no change"),
+            Ok(plan) => {
+                self.text_report = Some(plan.to_text());
+                self.status.set("Text request applied. Ctrl+Z undoes it");
+                self.history.break_coalescing();
+                self.edit_suite("text_request", move |s| plan.apply(s));
+                self.history.break_coalescing();
+            }
+            Err(e) if e == CANCELLED => self.status.set("Text request cancelled; nothing changed"),
+            Err(e) => self.status.set(format!("Text request: {}", e)),
         }
     }
 
@@ -1211,22 +1301,57 @@ impl MasteringApp {
                 self.open_device_dialog();
             }
         });
+        ui.horizontal_wrapped(|ui| self.text_request_row(ui, busy));
     }
 
-    /// Why Match reference (AI) can't run right now
-    fn style_match_blocker(&self, has_reference: bool) -> Option<&'static str> {
-        if !self.style_model_found {
-            Some("The style model models/afx_rep.onnx wasn't found")
-        } else if self.engine.audio_buffer().is_none() {
+    fn text_request_row(&mut self, ui: &mut egui::Ui, busy: bool) {
+        ui.label(RichText::new("Describe").color(DIM));
+        let field = egui::TextEdit::singleline(&mut self.text_request).hint_text("warmer, less harsh, wider").desired_width(280.0);
+        let typed = ui.add(field).on_hover_text("A rough first move in plain words. Small changes only; your ears or Match reference (AI) refine it");
+        let submitted = typed.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if self.text_running.load(Ordering::Acquire) {
+            if ui.button("Cancel").clicked() {
+                self.text_cancel.store(true, Ordering::Release);
+            }
+        } else if self.text_model_found.load(Ordering::Acquire) {
+            let blocker = self.suite_job_blocker().or(self.text_request.trim().is_empty().then_some("Type what you'd like to change"));
+            let mut resp = ui.add_enabled(!busy && blocker.is_none(), egui::Button::new("Apply (AI)"));
+            if let Some(why) = blocker {
+                resp = resp.on_disabled_hover_text(why);
+            }
+            if resp.clicked() || (submitted && !busy && blocker.is_none()) {
+                self.run_text_request();
+            }
+        } else if ui
+            .add_enabled(!busy, egui::Button::new("Download text model (1.1 GB)"))
+            .on_hover_text("Qwen2.5-1.5B from huggingface.co. It runs on this computer, so requests never leave it")
+            .clicked()
+        {
+            self.download_text_model();
+        }
+    }
+
+    /// Why a job that sets up the built-in suite for one track can't run right now
+    fn suite_job_blocker(&self) -> Option<&'static str> {
+        if self.engine.audio_buffer().is_none() {
             Some("Load a track first")
-        } else if !has_reference {
-            Some("Load a reference track first")
         } else if self.view == View::Album {
             Some("Works on a single track, not the album")
         } else if self.engine.processing_mode() == ProcessingMode::Vst3 {
             Some("Works on the built-in suite, not a fallback plugin")
         } else {
             None
+        }
+    }
+
+    /// Why Match reference (AI) can't run right now
+    fn style_match_blocker(&self, has_reference: bool) -> Option<&'static str> {
+        if !self.style_model_found {
+            Some("The style model models/afx_rep.onnx wasn't found")
+        } else if !has_reference {
+            Some("Load a reference track first")
+        } else {
+            self.suite_job_blocker()
         }
     }
 
@@ -1401,6 +1526,18 @@ impl MasteringApp {
         }
     }
 
+    fn text_request_window(&mut self, ctx: &egui::Context) {
+        let Some(text) = self.text_report.clone() else { return };
+        let mut open = true;
+        egui::Window::new("Text request (AI)").open(&mut open).resizable(false).show(ctx, |ui| {
+            ui.label(RichText::new(text).monospace());
+            ui.label(RichText::new("A rough first move from a small model: trust your ears. Ctrl+Z undoes it.").color(DIM).size(11.0));
+        });
+        if !open {
+            self.text_report = None;
+        }
+    }
+
     fn handle_screenshot(&mut self, ctx: &egui::Context) {
         let Some((path, frames)) = self.screenshot.as_mut() else { return };
         *frames += 1;
@@ -1433,6 +1570,7 @@ impl eframe::App for MasteringApp {
         self.engine.collect_garbage();
         self.apply_assistant_result();
         self.apply_style_match();
+        self.apply_text_request();
         self.handle_midi();
         self.handle_drops(ctx);
         self.handle_keys(ctx);
@@ -1490,6 +1628,7 @@ impl eframe::App for MasteringApp {
         self.device_window(ctx);
         self.assistant_window(ctx);
         self.style_match_window(ctx);
+        self.text_request_window(ctx);
         self.qc_window(ctx);
         self.handle_screenshot(ctx);
 

@@ -28,6 +28,12 @@ const SEARCHED: [(ModuleKind, usize, (f32, f32)); 7] = [
 
 const MAXIMIZER_CEILING: usize = 1;
 
+/// Whether an EQ band is on and has a shape its gain affects
+pub fn eq_band_can_shape_gain(suite: &MasteringSuite, band: usize) -> bool {
+    let b = &suite.dynamic_eq.bands[band];
+    b.enabled && !matches!(b.filter_type, EqFilterType::HighPass | EqFilterType::LowPass)
+}
+
 /// One searched parameter; `info` carries the search range rather than the slider's
 #[derive(Clone, Debug)]
 pub struct SearchParam {
@@ -82,10 +88,7 @@ impl SearchSpace {
     /// they're searched too and a match switches them on.
     pub fn for_suite(suite: &MasteringSuite, only_enabled: bool) -> Self {
         let mut space = Self::default();
-        let eq_params = EQ_BANDS.iter().filter(|(band, _)| {
-            let b = &suite.dynamic_eq.bands[*band];
-            b.enabled && !matches!(b.filter_type, EqFilterType::HighPass | EqFilterType::LowPass)
-        });
+        let eq_params = EQ_BANDS.iter().filter(|(band, _)| eq_band_can_shape_gain(suite, *band));
         let eq_params = eq_params.flat_map(|&(band, hz)| {
             let base = band * EQ_PARAMS_PER_BAND;
             [(ModuleKind::Equalizer, base + EQ_FREQUENCY, hz), (ModuleKind::Equalizer, base + EQ_GAIN, EQ_GAIN_RANGE)]

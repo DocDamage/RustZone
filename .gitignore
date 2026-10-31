@@ -1,3 +1,5 @@
 /target
+# The text model is downloaded on first use
+/models/*.gguf
 # Third-party plugin binaries are not part of this project
 /Ozone 12/

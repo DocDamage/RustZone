@@ -16,6 +16,7 @@ pub mod transient;
 pub mod vintage;
 pub mod style_space;
 pub mod style_match;
+pub mod text_edit;
 mod core_modules;
 
 pub use lufs::*;
@@ -34,6 +35,7 @@ pub use transient::*;
 pub use vintage::*;
 pub use style_space::{SearchParam, SearchSpace};
 pub use style_match::{match_to_reference, MatchOptions, MatchProgress, MatchResult};
+pub use text_edit::{plan_request, TextPlan};
 
 use std::f32::consts::PI;
 
