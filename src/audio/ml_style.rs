@@ -142,7 +142,7 @@ impl StyleFrontEnd {
         let padded = reflect_pad(x, NFFT / 2, NFFT / 2);
         let mut re = vec![0.0f32; NFFT];
         let mut im = vec![0.0f32; NFFT];
-        for (t, row) in out.chunks_exact_mut(BINS).take(frames).enumerate() {
+        for (t, row) in out.as_chunks_mut::<BINS>().0.iter_mut().take(frames).enumerate() {
             let start = t * HOP;
             for i in 0..NFFT {
                 re[i] = padded[start + i] * self.window[i];
@@ -217,7 +217,7 @@ impl StyleModel {
         if mid.len() != batch.len() * EMBED_DIM || side.len() != mid.len() {
             return Err("Style model returned unexpected tensor sizes".to_string());
         }
-        out.extend(mid.chunks_exact(EMBED_DIM).zip(side.chunks_exact(EMBED_DIM)).map(|(m, s)| StyleEmbedding::new(m, s)));
+        out.extend(mid.as_chunks::<EMBED_DIM>().0.iter().zip(side.as_chunks::<EMBED_DIM>().0).map(|(m, s)| StyleEmbedding::new(m, s)));
         Ok(())
     }
 }

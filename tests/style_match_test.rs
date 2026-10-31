@@ -191,7 +191,7 @@ fn test_embedding_matches_pytorch_and_ignores_gain() {
     println!("4 s clip embedded in {:.3} s", started.elapsed().as_secs_f32());
 
     let bytes = std::fs::read("tests/fixtures/afx_rep_demo_embedding.bin").expect("fixture");
-    let floats: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+    let floats: Vec<f32> = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
     let unit = |v: &[f32]| -> Vec<f32> {
         let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         v.iter().map(|x| x / n).collect()
