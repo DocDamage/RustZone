@@ -14,6 +14,8 @@ pub mod oversampling;
 pub mod spectral;
 pub mod transient;
 pub mod vintage;
+pub mod style_space;
+pub mod style_match;
 mod core_modules;
 
 pub use lufs::*;
@@ -30,6 +32,8 @@ pub use module::{Module, ModuleKind, ParamInfo, ParamUnit};
 pub use spectral::*;
 pub use transient::*;
 pub use vintage::*;
+pub use style_space::{SearchParam, SearchSpace};
+pub use style_match::{match_to_reference, MatchOptions, MatchProgress, MatchResult};
 
 use std::f32::consts::PI;
 

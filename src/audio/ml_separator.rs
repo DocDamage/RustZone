@@ -56,10 +56,15 @@ impl StemSet {
 /// Look for the model in `models/` under the working directory, next to the executable, or up to
 /// four parent folders of it (so `target\release\mastering_studio.exe` finds the repo copy)
 pub fn find_model() -> Option<PathBuf> {
-    let mut candidates = vec![PathBuf::from("models").join(MODEL_FILE)];
+    find_model_file(MODEL_FILE)
+}
+
+/// Find a file in the model folders `find_model` searches
+pub(super) fn find_model_file(name: &str) -> Option<PathBuf> {
+    let mut candidates = vec![PathBuf::from("models").join(name)];
     if let Ok(exe) = std::env::current_exe() {
         for dir in exe.ancestors().skip(1).take(5) {
-            candidates.push(dir.join("models").join(MODEL_FILE));
+            candidates.push(dir.join("models").join(name));
         }
     }
     // A checkout without Git LFS has a tiny text pointer instead of the model; ignore it
@@ -317,7 +322,7 @@ impl StftCore {
 }
 
 /// torch-style reflect padding (the edge sample is not repeated)
-fn reflect_pad(x: &[f32], left: usize, right: usize) -> Vec<f32> {
+pub(super) fn reflect_pad(x: &[f32], left: usize, right: usize) -> Vec<f32> {
     let n = x.len();
     let mut out = Vec::with_capacity(n + left + right);
     let reflect = |i: isize| -> f32 {

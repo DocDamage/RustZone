@@ -14,11 +14,15 @@ use super::plugin_window::PluginWindow;
 use super::widgets::{self, WaveformAction, ACCENT, DIM, WARN};
 use super::{discover_vst3_plugins, save_png, LaunchOptions, AUDIO_EXTENSIONS, EXPORT_FORMATS, TARGETS};
 use crate::audio::{
-    list_audio_hosts, list_output_devices, load_audio_file, render_to_buffer, render_to_file, AudioEngine, BwfMetadata,
+    list_audio_hosts, list_output_devices, load_audio_file, render_to_buffer, render_to_file, AudioBuffer, AudioEngine, BwfMetadata,
     CodecPreview, DeviceChoice, FadeShape, OutputDeviceInfo, PreviewMode, ProcessingMode, QcReport, QcTargets, RenderOptions,
-    RenderSource,
+    RenderSource, StyleModel,
 };
-use crate::dsp::{calculate_buffer_integrated_lufs, MasterAssistantReport, MasteringSuite, ModuleKind, XmlPreset, GENRES};
+use crate::dsp::style_match::CANCELLED;
+use crate::dsp::{
+    calculate_buffer_integrated_lufs, match_to_reference, MasterAssistantReport, MasteringSuite, MatchOptions, MatchResult, ModuleKind,
+    XmlPreset, GENRES,
+};
 use crate::midi::{MidiController, MidiEvent};
 use crate::session::{History, Session, SessionUiState, Snapshots, SESSION_EXTENSION, SLOT_NAMES};
 use crate::vst3::Vst3Plugin;
@@ -55,6 +59,8 @@ impl Status {
         self.0.lock().clone()
     }
 }
+
+type StyleOutcome = (Arc<AudioBuffer>, Result<MatchResult, String>);
 
 /// Device dialog state
 pub(super) struct DeviceDialog {
@@ -95,6 +101,15 @@ pub struct MasteringApp {
     assistant_uses_reference: bool,
     /// Finished Assistant analysis, waiting to be applied on the UI thread
     assistant_result: Arc<Mutex<Option<Result<MasterAssistantReport, String>>>>,
+    /// Whether the style model was found at startup
+    style_model_found: bool,
+    /// Match reference (AI) leaves switched-off modules alone
+    style_only_enabled: bool,
+    style_matching: Arc<AtomicBool>,
+    style_cancel: Arc<AtomicBool>,
+    /// Finished reference match and the track it was made for, waiting for the UI thread
+    style_result: Arc<Mutex<Option<StyleOutcome>>>,
+    style_report: Option<String>,
     /// Latest export QC report, set by the export job
     pub(super) qc_report: Arc<Mutex<Option<String>>>,
     /// Chain settings the loaded codec preview was rendered with (to flag it as out of date)
@@ -157,6 +172,12 @@ impl MasteringApp {
             genre: 0,
             assistant_uses_reference: true,
             assistant_result: Arc::new(Mutex::new(None)),
+            style_model_found: crate::audio::ml_style::find_model().is_some(),
+            style_only_enabled: true,
+            style_matching: Arc::new(AtomicBool::new(false)),
+            style_cancel: Arc::new(AtomicBool::new(false)),
+            style_result: Arc::new(Mutex::new(None)),
+            style_report: None,
             qc_report: Arc::new(Mutex::new(None)),
             preview_fingerprint: None,
             screenshot: options.screenshot.map(|p| (p, 0)),
@@ -479,6 +500,60 @@ impl MasteringApp {
                 self.assistant_report = Some(r.to_text());
             }
             Err(e) => self.status.set(format!("Assistant: {}", e)),
+        }
+    }
+
+    /// Search for the settings that bring the track closest to the reference, in the background;
+    /// `apply_style_match` sets the suite when it's done
+    fn run_style_match(&mut self) {
+        let (Some(track), Some(reference)) = (self.engine.audio_buffer(), self.engine.reference_buffer()) else {
+            self.status.set("Match reference: load a track and a reference first");
+            return;
+        };
+        let cancel = Arc::clone(&self.style_cancel);
+        let options = MatchOptions {
+            only_enabled: self.style_only_enabled,
+            ceiling_db: Some(TARGETS[self.target].ceiling_dbtp),
+            cancel: Some(Arc::clone(&cancel)),
+            ..Default::default()
+        };
+        let matching = Arc::clone(&self.style_matching);
+        let out = Arc::clone(&self.style_result);
+        let ctx = self.ctx.clone();
+        self.spawn_job(move |engine, status| {
+            matching.store(true, Ordering::Release);
+            cancel.store(false, Ordering::Release);
+            status.set("Matching reference: loading the style model…");
+            ctx.request_repaint();
+            let suite = engine.dsp_suite_snapshot();
+            let stems = engine.ml_stems();
+            let result = StyleModel::load_default().and_then(|mut model| {
+                match_to_reference(&track, &reference, &suite, &mut model, stems.as_deref(), &options, |p| {
+                    status.set(format!("Matching reference: gen {}/{}, {:.0}% closer", p.generation, p.generations, p.closer_percent));
+                    ctx.request_repaint();
+                })
+            });
+            *out.lock() = Some((track, result));
+            matching.store(false, Ordering::Release);
+        });
+    }
+
+    fn apply_style_match(&mut self) {
+        let Some((track, result)) = self.style_result.lock().take() else { return };
+        let same_track = self.engine.audio_buffer().is_some_and(|b| Arc::ptr_eq(&b, &track));
+        match result {
+            Ok(_) if !same_track => self.status.set("Match reference: the track changed, so the result was dropped"),
+            Ok(r) if r.improved() => {
+                let (space, best) = (r.space.clone(), r.best.clone());
+                self.history.break_coalescing();
+                self.edit_suite("style_match", move |s| space.decode(&best, s));
+                self.history.break_coalescing();
+                self.status.set(format!("Matched the reference: {:.0}% closer. Ctrl+Z undoes it", r.improvement_percent()));
+                self.style_report = Some(r.to_text());
+            }
+            Ok(_) => self.status.set("Match reference: the current settings were already the closest found"),
+            Err(e) if e == CANCELLED => self.status.set("Match reference cancelled; nothing changed"),
+            Err(e) => self.status.set(format!("Match reference: {}", e)),
         }
     }
 
@@ -1091,6 +1166,25 @@ impl MasteringApp {
                     Err(e) => self.status.set(e),
                 }
             }
+            if self.style_matching.load(Ordering::Acquire) {
+                if ui.button("Cancel match").clicked() {
+                    self.style_cancel.store(true, Ordering::Release);
+                }
+            } else {
+                let blocker = self.style_match_blocker(has_ref);
+                let button = egui::Button::new("Match reference (AI)");
+                let mut resp = ui
+                    .add_enabled(!busy && blocker.is_none(), button)
+                    .on_hover_text("Search for suite settings that make the track sound like the reference. Takes a minute or two; Ctrl+Z undoes it");
+                if let Some(why) = blocker {
+                    resp = resp.on_disabled_hover_text(why);
+                }
+                if resp.clicked() {
+                    self.run_style_match();
+                }
+            }
+            ui.checkbox(&mut self.style_only_enabled, "Only adjust enabled modules")
+                .on_hover_text("When off, Match reference (AI) may switch modules on");
             ui.separator();
             if ui.add_enabled(!busy, egui::Button::new("Assistant")).on_hover_text("Analyse the track and set up the suite (A)").clicked() {
                 self.run_assistant();
@@ -1117,6 +1211,23 @@ impl MasteringApp {
                 self.open_device_dialog();
             }
         });
+    }
+
+    /// Why Match reference (AI) can't run right now
+    fn style_match_blocker(&self, has_reference: bool) -> Option<&'static str> {
+        if !self.style_model_found {
+            Some("The style model models/afx_rep.onnx wasn't found")
+        } else if self.engine.audio_buffer().is_none() {
+            Some("Load a track first")
+        } else if !has_reference {
+            Some("Load a reference track first")
+        } else if self.view == View::Album {
+            Some("Works on a single track, not the album")
+        } else if self.engine.processing_mode() == ProcessingMode::Vst3 {
+            Some("Works on the built-in suite, not a fallback plugin")
+        } else {
+            None
+        }
     }
 
     fn transport(&mut self, ui: &mut egui::Ui, meters: &crate::audio::MeterLevels) {
@@ -1278,6 +1389,18 @@ impl MasteringApp {
         }
     }
 
+    fn style_match_window(&mut self, ctx: &egui::Context) {
+        let Some(text) = self.style_report.clone() else { return };
+        let mut open = true;
+        egui::Window::new("Match reference (AI)").open(&mut open).resizable(false).show(ctx, |ui| {
+            ui.label(RichText::new(text).monospace());
+            ui.label(RichText::new("Ctrl+Z undoes the whole match. Try it against another snapshot slot (Ctrl+1 to 4).").color(DIM).size(11.0));
+        });
+        if !open {
+            self.style_report = None;
+        }
+    }
+
     fn handle_screenshot(&mut self, ctx: &egui::Context) {
         let Some((path, frames)) = self.screenshot.as_mut() else { return };
         *frames += 1;
@@ -1309,6 +1432,7 @@ impl eframe::App for MasteringApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.engine.collect_garbage();
         self.apply_assistant_result();
+        self.apply_style_match();
         self.handle_midi();
         self.handle_drops(ctx);
         self.handle_keys(ctx);
@@ -1365,6 +1489,7 @@ impl eframe::App for MasteringApp {
 
         self.device_window(ctx);
         self.assistant_window(ctx);
+        self.style_match_window(ctx);
         self.qc_window(ctx);
         self.handle_screenshot(ctx);
 

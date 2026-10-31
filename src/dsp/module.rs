@@ -75,6 +75,18 @@ impl ParamInfo {
         }
     }
 
+    /// Nearest value on the grid of wheel notches, counted from `min`
+    pub fn snapped(&self, value: f32) -> f32 {
+        let v = value.clamp(self.min, self.max);
+        let snapped = if self.log {
+            let notch = (1.0 + self.step).ln();
+            self.min * ((v / self.min).ln() / notch).round().mul_add(notch, 0.0).exp()
+        } else {
+            self.min + ((v - self.min) / self.step).round() * self.step
+        };
+        snapped.clamp(self.min, self.max)
+    }
+
     pub fn format(&self, value: f32) -> String {
         match self.unit {
             ParamUnit::Db => format!("{:+.1} dB", value),

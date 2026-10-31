@@ -59,7 +59,7 @@ All DSP modules are original implementations. The spectral modules (Match EQ, St
 
 ### Undo, snapshots and sessions
 
-- **Undo / redo** (`Ctrl+Z` / `Ctrl+Y`) covers every suite change: parameters, module on/off, chain order, auto gain, presets, the Assistant, loudness targets and Match EQ learning. A slider drag or wheel spin counts as one step.
+- **Undo / redo** (`Ctrl+Z` / `Ctrl+Y`) covers every suite change: parameters, module on/off, chain order, auto gain, presets, the Assistant, reference matching, loudness targets and Match EQ learning. A slider drag or wheel spin counts as one step.
 - **Snapshots A/B/C/D** (`Ctrl+1`–`Ctrl+4`) hold four complete chain settings for comparison. Switching away keeps your edits in that slot; right-click a slot to copy the current settings into it.
 - **Sessions** (`.mstsession`, `Ctrl+S`) save the track and reference paths, the full suite, the snapshots, trim and fades, loudness-matched A/B, the album and the export and target choices.
 
@@ -70,6 +70,7 @@ All DSP modules are original implementations. The spectral modules (Match EQ, St
 - **Referencing:** A/B against a reference track, with automatic loudness matching.
 - **Loudness targets:** Spotify / Apple / YouTube / CD-club / broadcast. The target sets the maximizer drive and ceiling.
 - **Master Assistant (`A`):** analyses the track in the background (loudness, loudness range, peak-to-loudness ratio, tonal balance in seven bands relative to pink noise, low-end phase, stereo width, static resonances). It then suggests and applies a chain aimed at a **genre profile** (Balanced, Pop, Hip-hop / R&B, Electronic, Rock, Acoustic, Jazz, Classical). The suggestions are EQ moves that correct half of each difference (at most ±3 dB) and a notch on any resonance; the Vintage Compressor for over-dynamic mixes or Transient Restore for squashed ones; the Spectral Shaper for bright mixes; the Bass Enhancer for a thin sub; and width, mono-maker and exciter settings to suit the genre. With **Match reference** ticked and a reference track loaded, the reference becomes the target instead: Match EQ learns its tone, and its dynamics and stereo width set the goals. The report explains each choice, and the result is a single undo step.
+- **Match reference (AI):** with a track and a reference loaded, searches for the suite settings that make the track sound like the reference, then applies them as a single undo step and lists what changed. A style model (AFx-Rep, bundled, runs on the CPU) only scores how close candidates sound; the suite's own modules do the processing. The search covers the EQ, Vintage Compressor, Stereo Imager, Harmonic Exciter and Maximizer drive, holds the ceiling at the loudness target, and takes a minute or two. **Only adjust enabled modules** keeps it away from modules you've switched off. It sits next to Match EQ's *Learn from reference track* (tone only) and the Master Assistant (rule-based), and neither changes.
 - **Trim & fades:** set in/out points at the playhead, with S-curve, exponential or linear fades.
 - **Album montage:** sequence tracks with pregaps, balance loudness, reorder / skip / remove tracks, play the whole album through the chain, and export one mastered WAV plus a CUE sheet. Tracks at other sample rates are resampled.
 - **Stem mixer:** split a track into 6 stems (or load stem files) and remix gain / pan / mute / solo.
@@ -158,7 +159,8 @@ The audio callback owns everything it processes (suite, track, plugin, stems) an
 ```
 src/
 ├── audio/        buffer, decoder, lock-free CPAL engine, renderer (latency, dither, resampling),
-│                 resampler, montage, stems & separator, ml_separator (HTDemucs), trim/fades, BWF
+│                 resampler, montage, stems & separator, ml_separator (HTDemucs),
+│                 ml_style (AFx-Rep style embeddings), trim/fades, BWF
 ├── dsp/
 │   ├── module.rs        Module trait, parameter descriptions, module registry
 │   ├── stft.rs          Streaming STFT shared by the spectral modules
@@ -167,6 +169,8 @@ src/
 │   ├── spectral.rs      Match EQ, Spectral Shaper, Tonal Stabilizer, Stem Rebalance, Stem EQ
 │   ├── transient.rs     Low-End Shaper, Multiband Transient Shaper, Transient Restore, Bass Enhancer
 │   ├── vintage.rs       Vintage Compressor, Passive EQ, Opto Limiter, Tape Saturation
+│   ├── style_space.rs   Match reference (AI): searchable parameters as a [0, 1] vector
+│   ├── style_match.rs   Match reference (AI): CMA-ES search and candidate rendering
 │   ├── mod.rs           MasteringSuite (ordered chain), biquads, imager, exciter
 │   └── ...              EQ, multiband, maximizer, clarity, dither, LUFS / true peak, FFT analyzer,
 │                        assistant, XML presets
@@ -177,7 +181,7 @@ src/
 ├── vst3/         Generic VST3 host (fallback plugins only)
 ├── lib.rs
 └── main.rs
-models/           htdemucs.onnx (Git LFS) and its licence
+models/           htdemucs.onnx and afx_rep.onnx (Git LFS), their licences, the AFx-Rep export script
 tests/
 ├── mastering_suite_test.rs   engine, export, montage, stems, presets, metering
 ├── module_suite_test.rs      behaviour of the suite's modules
@@ -186,6 +190,8 @@ tests/
 ├── oversampling_test.rs      transparency, latency, alias reduction
 ├── crossover_test.rs         multiband bands sum flat
 ├── golden_test.rs            output must match tests/golden/
-└── ml_separation_test.rs     trained stem separation and rebalance on stems
+├── ml_separation_test.rs     trained stem separation and rebalance on stems
+├── style_space_test.rs       Match reference (AI): the searched parameters
+└── style_match_test.rs       Match reference (AI): optimiser, rendering, style model, recovery
 examples/bench_modules.rs     per-module CPU benchmark
 ```
