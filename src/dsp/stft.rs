@@ -1,6 +1,11 @@
 //! Streaming short-time Fourier transform with overlap-add resynthesis, shared by the spectral
 //! modules. Square-root Hann windows at 75% overlap reconstruct the input exactly when the
 //! spectrum is left untouched; the processing delay is one FFT length.
+//!
+//! Each spectral module owns an STFT for standalone use, but the suite runs neighbouring
+//! spectral modules in one shared pass: one analysis, every module's frame processing in chain
+//! order, one resynthesis. That costs one FFT pair and one FFT length of latency per pass
+//! instead of per module.
 
 use std::f32::consts::PI;
 use crate::audio::Radix2Fft;
@@ -46,6 +51,36 @@ impl SpectralFrame<'_> {
     }
 }
 
+/// Analysis computed once per frame of a shared pass and handed to every module in it
+#[derive(Clone, Copy, Default)]
+pub struct FrameAnalysis<'a> {
+    /// Stem masks (vocals, bass, drums, other) of the pass's input, when a module asked for them
+    pub stem_masks: Option<&'a [Vec<f32>; 4]>,
+}
+
+/// A module that works on STFT frames, so it can join a shared spectral pass
+pub trait SpectralProcess {
+    /// Process one frame in place (bins 0..=N/2, mirrored by `SpectralFrame::scale_bin`)
+    fn process_frame(&mut self, frame: &mut SpectralFrame, analysis: &FrameAnalysis);
+    /// Whether `process_frame` uses `FrameAnalysis::stem_masks`
+    fn uses_stem_masks(&self) -> bool {
+        false
+    }
+    /// The module's own STFT, used when it processes on its own
+    fn own_stft(&mut self) -> &mut StftProcessor;
+
+    /// Stream audio through the module's own STFT (outside a shared pass)
+    fn process_standalone(&mut self, left: &mut [f32], right: &mut [f32])
+    where
+        Self: Sized,
+    {
+        // Borrow the STFT out (the placeholder allocates nothing) so frames can borrow the module
+        let mut stft = std::mem::replace(self.own_stft(), StftProcessor::placeholder());
+        stft.process(left, right, &mut |frame| self.process_frame(frame, &FrameAnalysis::default()));
+        *self.own_stft() = stft;
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct StftProcessor {
     fft: Radix2Fft,
@@ -85,6 +120,23 @@ impl StftProcessor {
             im_l: vec![0.0; n],
             re_r: vec![0.0; n],
             im_r: vec![0.0; n],
+        }
+    }
+
+    /// An unusable, allocation-free stand-in while the real processor is borrowed out
+    fn placeholder() -> Self {
+        Self {
+            fft: Radix2Fft::placeholder(),
+            window: Vec::new(),
+            in_l: Vec::new(),
+            in_r: Vec::new(),
+            out_l: Vec::new(),
+            out_r: Vec::new(),
+            fill: 0,
+            re_l: Vec::new(),
+            im_l: Vec::new(),
+            re_r: Vec::new(),
+            im_r: Vec::new(),
         }
     }
 

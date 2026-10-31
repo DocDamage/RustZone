@@ -2,7 +2,7 @@
 //! and the stem-aware Stem Rebalance / Stem EQ, which share a real-time stem masker.
 
 use super::module::{db_to_gain, gain_to_db, time_coeff, Module, ParamInfo, ParamUnit};
-use super::stft::{bin_freq, SpectralFrame, StftProcessor, STFT_BINS, STFT_HOP, STFT_SIZE};
+use super::stft::{bin_freq, FrameAnalysis, SpectralFrame, SpectralProcess, StftProcessor, STFT_BINS, STFT_HOP, STFT_SIZE};
 use crate::audio::{AudioBuffer, Radix2Fft};
 use std::f32::consts::PI;
 
@@ -33,12 +33,13 @@ fn match_point_count() -> usize {
     ((MATCH_F_MAX / MATCH_F_MIN).log2() * MATCH_POINTS_PER_OCT) as usize + 1
 }
 
-fn match_point_freq(p: usize) -> f32 {
+/// Frequency of point `p` on the Match EQ's log grid (24 points per octave from 20 Hz)
+pub(crate) fn match_point_freq(p: usize) -> f32 {
     MATCH_F_MIN * 2.0f32.powf(p as f32 / MATCH_POINTS_PER_OCT)
 }
 
 /// Long-term average spectrum of a buffer on the Match EQ's log-frequency grid, in dB
-fn average_spectrum_db(buf: &AudioBuffer) -> Vec<f32> {
+pub(crate) fn average_spectrum_db(buf: &AudioBuffer) -> Vec<f32> {
     let n = STFT_SIZE;
     let fft = Radix2Fft::new(n);
     let window: Vec<f32> = (0..n).map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / n as f32).cos())).collect();
@@ -230,15 +231,10 @@ impl Module for MatchEq {
         self.rebuild();
     }
     fn reset(&mut self) { self.stft.reset(); }
-    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
-        let gains = &self.bin_gain;
-        self.stft.process(left, right, &mut |frame: &mut SpectralFrame| {
-            for (k, &g) in gains.iter().enumerate() {
-                frame.scale_bin(k, g);
-            }
-        });
-    }
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) { self.process_standalone(left, right); }
     fn latency(&self) -> usize { self.stft.latency() }
+    fn spectral(&mut self) -> Option<&mut dyn SpectralProcess> { Some(self) }
+    fn is_spectral(&self) -> bool { true }
     fn status(&self) -> Option<String> {
         Some(if self.is_learned() {
             let max = self.curve_db.iter().fold(0.0f32, |a, d| a.max(d.abs()));
@@ -247,6 +243,15 @@ impl Module for MatchEq {
             "Not learned: load a reference track, then click Learn".to_string()
         })
     }
+}
+
+impl SpectralProcess for MatchEq {
+    fn process_frame(&mut self, frame: &mut SpectralFrame, _analysis: &FrameAnalysis) {
+        for (k, &g) in self.bin_gain.iter().enumerate() {
+            frame.scale_bin(k, g);
+        }
+    }
+    fn own_stft(&mut self) -> &mut StftProcessor { &mut self.stft }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -324,43 +329,10 @@ impl Module for SpectralShaper {
         self.stft.reset();
         self.reduction_db.fill(0.0);
     }
-    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
-        let sr = self.sample_rate;
-        let att = frame_coeff(self.attack_ms, sr);
-        let rel = frame_coeff(self.release_ms, sr);
-        let (low, high, thr, amt) = (self.low_hz, self.high_hz, self.threshold_db, self.amount_db);
-        let reduction = &mut self.reduction_db;
-        let mag_db = &mut self.mag_db;
-        let prefix = &mut self.prefix;
-        let mut frame_max = 0.0f32;
-
-        self.stft.process(left, right, &mut |frame: &mut SpectralFrame| {
-            for k in 0..STFT_BINS {
-                mag_db[k] = gain_to_db(frame.mag_l(k).max(frame.mag_r(k)) + 1e-9);
-                prefix[k + 1] = prefix[k] + mag_db[k];
-            }
-            for k in 1..STFT_BINS {
-                let f = bin_freq(k, sr);
-                // Band weight with half-octave soft edges
-                let w = smoothstep(low / 1.41, low, f) * (1.0 - smoothstep(high, high * 1.41, f));
-                let target = if w > 0.0 {
-                    let half = (k / 10).max(3);
-                    let lo = k.saturating_sub(half);
-                    let hi = (k + half).min(STFT_BINS - 1);
-                    let avg = (prefix[hi + 1] - prefix[lo]) / (hi - lo + 1) as f32;
-                    ((mag_db[k] - avg - thr).max(0.0) * 0.7).min(amt) * w
-                } else {
-                    0.0
-                };
-                let c = if target > reduction[k] { att } else { rel };
-                reduction[k] = target + c * (reduction[k] - target);
-                frame_max = frame_max.max(reduction[k]);
-                frame.scale_bin(k, db_to_gain(-reduction[k]));
-            }
-        });
-        self.max_reduction = frame_max.max(self.max_reduction * 0.9);
-    }
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) { self.process_standalone(left, right); }
     fn latency(&self) -> usize { self.stft.latency() }
+    fn spectral(&mut self) -> Option<&mut dyn SpectralProcess> { Some(self) }
+    fn is_spectral(&self) -> bool { true }
     fn status(&self) -> Option<String> {
         Some(format!("Peak reduction: {:.1} dB", self.max_reduction))
     }
@@ -370,6 +342,42 @@ impl Module for SpectralShaper {
     fn set_meters(&mut self, m: [f32; 4]) {
         self.max_reduction = m[0];
     }
+}
+
+impl SpectralProcess for SpectralShaper {
+    fn process_frame(&mut self, frame: &mut SpectralFrame, _analysis: &FrameAnalysis) {
+        let sr = self.sample_rate;
+        let att = frame_coeff(self.attack_ms, sr);
+        let rel = frame_coeff(self.release_ms, sr);
+        let (low, high, thr, amt) = (self.low_hz, self.high_hz, self.threshold_db, self.amount_db);
+        let (reduction, mag_db, prefix) = (&mut self.reduction_db, &mut self.mag_db, &mut self.prefix);
+        let mut frame_max = 0.0f32;
+
+        for k in 0..STFT_BINS {
+            mag_db[k] = gain_to_db(frame.mag_l(k).max(frame.mag_r(k)) + 1e-9);
+            prefix[k + 1] = prefix[k] + mag_db[k];
+        }
+        for k in 1..STFT_BINS {
+            let f = bin_freq(k, sr);
+            // Band weight with half-octave soft edges
+            let w = smoothstep(low / 1.41, low, f) * (1.0 - smoothstep(high, high * 1.41, f));
+            let target = if w > 0.0 {
+                let half = (k / 10).max(3);
+                let lo = k.saturating_sub(half);
+                let hi = (k + half).min(STFT_BINS - 1);
+                let avg = (prefix[hi + 1] - prefix[lo]) / (hi - lo + 1) as f32;
+                ((mag_db[k] - avg - thr).max(0.0) * 0.7).min(amt) * w
+            } else {
+                0.0
+            };
+            let c = if target > reduction[k] { att } else { rel };
+            reduction[k] = target + c * (reduction[k] - target);
+            frame_max = frame_max.max(reduction[k]);
+            frame.scale_bin(k, db_to_gain(-reduction[k]));
+        }
+        self.max_reduction = frame_max.max(self.max_reduction * 0.9);
+    }
+    fn own_stft(&mut self) -> &mut StftProcessor { &mut self.stft }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -456,56 +464,10 @@ impl Module for TonalStabilizer {
         self.correction_db = [0.0; STAB_BANDS];
         self.primed = false;
     }
-    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
-        let sr = self.sample_rate;
-        let coeff = frame_coeff(self.speed_ms, sr);
-        let tilt = STAB_TILT_DB_PER_OCT[self.target.min(3)];
-        let (amount, max_corr) = (self.amount, self.max_correction_db);
-        let band_level = &mut self.band_level;
-        let correction = &mut self.correction_db;
-        let primed = &mut self.primed;
-
-        self.stft.process(left, right, &mut |frame: &mut SpectralFrame| {
-            let mut power = [0.0f32; STAB_BANDS];
-            let mut total = 0.0f32;
-            for k in 1..STFT_BINS {
-                let f = bin_freq(k, sr);
-                if f < stab_band_edge(0) || f >= stab_band_edge(STAB_BANDS) {
-                    continue;
-                }
-                let b = (((f / 30.0).ln() / (16000.0f32 / 30.0).ln()) * STAB_BANDS as f32) as usize;
-                let p = frame.mag_l(k).powi(2) + frame.mag_r(k).powi(2);
-                power[b.min(STAB_BANDS - 1)] += p;
-                total += p;
-            }
-            // Don't learn from silence
-            if total > 1e-6 {
-                for b in 0..STAB_BANDS {
-                    let db = 10.0 * (power[b] + 1e-12).log10();
-                    band_level[b] = if *primed { db + coeff * (band_level[b] - db) } else { db };
-                }
-                *primed = true;
-                // Bands are equal width in octaves, so pink noise reads flat; compare to the tilt
-                let dev: Vec<f32> = (0..STAB_BANDS)
-                    .map(|b| band_level[b] - tilt * (stab_band_center(b) / 1000.0).log2())
-                    .collect();
-                let mean = dev.iter().sum::<f32>() / STAB_BANDS as f32;
-                for b in 0..STAB_BANDS {
-                    correction[b] = (-(dev[b] - mean) * amount).clamp(-max_corr, max_corr);
-                }
-            }
-            for k in 1..STFT_BINS {
-                let f = bin_freq(k, sr).clamp(stab_band_center(0), stab_band_center(STAB_BANDS - 1));
-                let pos = ((f / stab_band_center(0)).ln() / (stab_band_center(STAB_BANDS - 1) / stab_band_center(0)).ln())
-                    * (STAB_BANDS - 1) as f32;
-                let i0 = (pos.floor() as usize).min(STAB_BANDS - 1);
-                let i1 = (i0 + 1).min(STAB_BANDS - 1);
-                let t = pos - i0 as f32;
-                frame.scale_bin(k, db_to_gain(correction[i0] * (1.0 - t) + correction[i1] * t));
-            }
-        });
-    }
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) { self.process_standalone(left, right); }
     fn latency(&self) -> usize { self.stft.latency() }
+    fn spectral(&mut self) -> Option<&mut dyn SpectralProcess> { Some(self) }
+    fn is_spectral(&self) -> bool { true }
     fn status(&self) -> Option<String> {
         let [lo, hi, _, _] = self.meters();
         Some(format!("Correction: {:+.1} .. {:+.1} dB", lo, hi))
@@ -520,6 +482,56 @@ impl Module for TonalStabilizer {
         self.correction_db[0] = m[0];
         self.correction_db[1] = m[1];
     }
+}
+
+impl SpectralProcess for TonalStabilizer {
+    fn process_frame(&mut self, frame: &mut SpectralFrame, _analysis: &FrameAnalysis) {
+        let sr = self.sample_rate;
+        let coeff = frame_coeff(self.speed_ms, sr);
+        let tilt = STAB_TILT_DB_PER_OCT[self.target.min(3)];
+        let (amount, max_corr) = (self.amount, self.max_correction_db);
+
+        let mut power = [0.0f32; STAB_BANDS];
+        let mut total = 0.0f32;
+        for k in 1..STFT_BINS {
+            let f = bin_freq(k, sr);
+            if f < stab_band_edge(0) || f >= stab_band_edge(STAB_BANDS) {
+                continue;
+            }
+            let b = (((f / 30.0).ln() / (16000.0f32 / 30.0).ln()) * STAB_BANDS as f32) as usize;
+            let p = frame.mag_l(k).powi(2) + frame.mag_r(k).powi(2);
+            power[b.min(STAB_BANDS - 1)] += p;
+            total += p;
+        }
+        // Don't learn from silence
+        if total > 1e-6 {
+            for b in 0..STAB_BANDS {
+                let db = 10.0 * (power[b] + 1e-12).log10();
+                self.band_level[b] = if self.primed { db + coeff * (self.band_level[b] - db) } else { db };
+            }
+            self.primed = true;
+            // Bands are equal width in octaves, so pink noise reads flat; compare to the tilt
+            let mut dev = [0.0f32; STAB_BANDS];
+            for b in 0..STAB_BANDS {
+                dev[b] = self.band_level[b] - tilt * (stab_band_center(b) / 1000.0).log2();
+            }
+            let mean = dev.iter().sum::<f32>() / STAB_BANDS as f32;
+            for b in 0..STAB_BANDS {
+                self.correction_db[b] = (-(dev[b] - mean) * amount).clamp(-max_corr, max_corr);
+            }
+        }
+        let correction = &self.correction_db;
+        for k in 1..STFT_BINS {
+            let f = bin_freq(k, sr).clamp(stab_band_center(0), stab_band_center(STAB_BANDS - 1));
+            let pos = ((f / stab_band_center(0)).ln() / (stab_band_center(STAB_BANDS - 1) / stab_band_center(0)).ln())
+                * (STAB_BANDS - 1) as f32;
+            let i0 = (pos.floor() as usize).min(STAB_BANDS - 1);
+            let i1 = (i0 + 1).min(STAB_BANDS - 1);
+            let t = pos - i0 as f32;
+            frame.scale_bin(k, db_to_gain(correction[i0] * (1.0 - t) + correction[i1] * t));
+        }
+    }
+    fn own_stft(&mut self) -> &mut StftProcessor { &mut self.stft }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -651,19 +663,29 @@ impl Module for StemRebalance {
         self.stft.reset();
         self.masker.reset();
     }
-    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
-        let sr = self.sample_rate;
-        let g = self.gains_db.map(db_to_gain);
-        let masker = &mut self.masker;
-        self.stft.process(left, right, &mut |frame: &mut SpectralFrame| {
-            masker.analyze(frame, sr);
-            for k in 0..STFT_BINS {
-                let gain = (0..4).map(|s| masker.masks[s][k] * g[s]).sum::<f32>();
-                frame.scale_bin(k, gain);
-            }
-        });
-    }
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) { self.process_standalone(left, right); }
     fn latency(&self) -> usize { self.stft.latency() }
+    fn spectral(&mut self) -> Option<&mut dyn SpectralProcess> { Some(self) }
+    fn is_spectral(&self) -> bool { true }
+}
+
+impl SpectralProcess for StemRebalance {
+    fn process_frame(&mut self, frame: &mut SpectralFrame, analysis: &FrameAnalysis) {
+        let g = self.gains_db.map(db_to_gain);
+        let masks = match analysis.stem_masks {
+            Some(m) => m,
+            None => {
+                self.masker.analyze(frame, self.sample_rate);
+                &self.masker.masks
+            }
+        };
+        for k in 0..STFT_BINS {
+            let gain = (0..4).map(|s| masks[s][k] * g[s]).sum::<f32>();
+            frame.scale_bin(k, gain);
+        }
+    }
+    fn uses_stem_masks(&self) -> bool { true }
+    fn own_stft(&mut self) -> &mut StftProcessor { &mut self.stft }
 }
 
 #[derive(Clone, Debug)]
@@ -735,17 +757,26 @@ impl Module for StemEq {
         self.stft.reset();
         self.masker.reset();
     }
-    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
-        let sr = self.sample_rate;
-        let table = &self.gain_table;
-        let masker = &mut self.masker;
-        self.stft.process(left, right, &mut |frame: &mut SpectralFrame| {
-            masker.analyze(frame, sr);
-            for k in 0..STFT_BINS {
-                let gain = (0..4).map(|s| masker.masks[s][k] * table[k][s]).sum::<f32>();
-                frame.scale_bin(k, gain);
-            }
-        });
-    }
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) { self.process_standalone(left, right); }
     fn latency(&self) -> usize { self.stft.latency() }
+    fn spectral(&mut self) -> Option<&mut dyn SpectralProcess> { Some(self) }
+    fn is_spectral(&self) -> bool { true }
+}
+
+impl SpectralProcess for StemEq {
+    fn process_frame(&mut self, frame: &mut SpectralFrame, analysis: &FrameAnalysis) {
+        let masks = match analysis.stem_masks {
+            Some(m) => m,
+            None => {
+                self.masker.analyze(frame, self.sample_rate);
+                &self.masker.masks
+            }
+        };
+        for k in 0..STFT_BINS {
+            let gain = (0..4).map(|s| masks[s][k] * self.gain_table[k][s]).sum::<f32>();
+            frame.scale_bin(k, gain);
+        }
+    }
+    fn uses_stem_masks(&self) -> bool { true }
+    fn own_stft(&mut self) -> &mut StftProcessor { &mut self.stft }
 }

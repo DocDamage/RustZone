@@ -13,7 +13,7 @@ mod widgets;
 
 use std::path::PathBuf;
 
-use crate::audio::ExportBitDepth;
+use crate::audio::{ExportBitDepth, ExportCodec};
 
 pub use app::MasteringApp;
 
@@ -35,16 +35,30 @@ pub const TARGETS: [LoudnessTarget; 5] = [
 #[derive(Clone, Copy)]
 pub struct ExportFormat {
     pub name: &'static str,
-    pub bit_depth: ExportBitDepth,
+    pub codec: ExportCodec,
     pub sample_rate: Option<u32>,
 }
 
-/// Integer formats are dithered by the renderer
-pub const EXPORT_FORMATS: [ExportFormat; 4] = [
-    ExportFormat { name: "24-bit WAV, native rate", bit_depth: ExportBitDepth::Bit24, sample_rate: None },
-    ExportFormat { name: "16-bit / 44.1 kHz CD WAV", bit_depth: ExportBitDepth::Bit16, sample_rate: Some(44100) },
-    ExportFormat { name: "32-bit float WAV, native rate", bit_depth: ExportBitDepth::Float32, sample_rate: None },
-    ExportFormat { name: "24-bit / 48 kHz WAV (video)", bit_depth: ExportBitDepth::Bit24, sample_rate: Some(48000) },
+impl ExportFormat {
+    /// File-dialog filter name and extension
+    pub fn filter(&self) -> (&'static str, &'static str) {
+        (self.codec.name(), self.codec.extension())
+    }
+}
+
+/// Integer and lossy formats are dithered by the renderer. New formats go at the end: sessions
+/// store the index.
+pub const EXPORT_FORMATS: [ExportFormat; 10] = [
+    ExportFormat { name: "24-bit WAV, native rate", codec: ExportCodec::Wav(ExportBitDepth::Bit24), sample_rate: None },
+    ExportFormat { name: "16-bit / 44.1 kHz CD WAV", codec: ExportCodec::Wav(ExportBitDepth::Bit16), sample_rate: Some(44100) },
+    ExportFormat { name: "32-bit float WAV, native rate", codec: ExportCodec::Wav(ExportBitDepth::Float32), sample_rate: None },
+    ExportFormat { name: "24-bit / 48 kHz WAV (video)", codec: ExportCodec::Wav(ExportBitDepth::Bit24), sample_rate: Some(48000) },
+    ExportFormat { name: "FLAC 24-bit, native rate", codec: ExportCodec::Flac(ExportBitDepth::Bit24), sample_rate: None },
+    ExportFormat { name: "FLAC 16-bit / 44.1 kHz", codec: ExportCodec::Flac(ExportBitDepth::Bit16), sample_rate: Some(44100) },
+    ExportFormat { name: "MP3 320 kbps", codec: ExportCodec::Mp3(320), sample_rate: None },
+    ExportFormat { name: "MP3 192 kbps", codec: ExportCodec::Mp3(192), sample_rate: None },
+    ExportFormat { name: "AAC 192 kbps (.m4a)", codec: ExportCodec::Aac(192), sample_rate: None },
+    ExportFormat { name: "AAC 128 kbps (.m4a)", codec: ExportCodec::Aac(128), sample_rate: None },
 ];
 
 pub const AUDIO_EXTENSIONS: [&str; 7] = ["wav", "mp3", "flac", "aif", "aiff", "aac", "m4a"];

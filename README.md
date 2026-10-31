@@ -40,7 +40,9 @@ A chain of 19 modules. Each one can be switched on or off independently, and the
 
 **Phase-coherent multiband.** Multiband Dynamics, the Multiband Transient Shaper and the Stereo Imager split with Linkwitz-Riley crossovers whose bands are all-pass compensated, so with neutral settings they sum flat (within ±0.001 dB).
 
-All DSP modules are original implementations. The spectral modules (Match EQ, Stem EQ, Stem Rebalance, Spectral Shaper, Tonal Stabilizer) share one streaming FFT engine (2048-point, 75% overlap) that reconstructs the signal exactly at neutral settings. Each adds 2048 samples of latency while enabled. The total is shown in the editor and compensated on export.
+All DSP modules are original implementations. The spectral modules (Match EQ, Stem EQ, Stem Rebalance, Spectral Shaper, Tonal Stabilizer) share one streaming FFT engine (2048-point, 75% overlap) that reconstructs the signal exactly at neutral settings.
+
+**Shared spectral pass.** Neighbouring spectral modules (with only switched-off modules between them) run in one shared pass: one analysis, each module's processing on the same spectrum in chain order, then one resynthesis. Stem Rebalance and Stem EQ also share their stem masks. A pass adds 2048 samples of latency however many modules it holds, so the default order with all five on costs 2 × 2048 samples instead of 5 × 2048. With every module switched on, CPU use drops from about 12% of a core to about 9%. The sound matches running the modules one after another (38 dB SNR with every module set off neutral, and bit-exact at neutral settings). A module with auto gain-match keeps its own FFT, because gain-matching measures its own input and output. The editor shows the chain latency and how many modules share a pass, and exports compensate for it.
 
 ### Honest comparisons
 
@@ -67,11 +69,13 @@ All DSP modules are original implementations. The spectral modules (Match EQ, St
 - **Metering:** peak / RMS VU, integrated / short-term / momentary LUFS, true peak, phase correlation, and a spectrum analyzer.
 - **Referencing:** A/B against a reference track, with automatic loudness matching.
 - **Loudness targets:** Spotify / Apple / YouTube / CD-club / broadcast. The target sets the maximizer drive and ceiling.
-- **Master Assistant (`A`):** analyses the track, sets up the suite, and shows a full report.
+- **Master Assistant (`A`):** analyses the track in the background (loudness, loudness range, peak-to-loudness ratio, tonal balance in seven bands relative to pink noise, low-end phase, stereo width, static resonances). It then suggests and applies a chain aimed at a **genre profile** (Balanced, Pop, Hip-hop / R&B, Electronic, Rock, Acoustic, Jazz, Classical). The suggestions are EQ moves that correct half of each difference (at most ±3 dB) and a notch on any resonance; the Vintage Compressor for over-dynamic mixes or Transient Restore for squashed ones; the Spectral Shaper for bright mixes; the Bass Enhancer for a thin sub; and width, mono-maker and exciter settings to suit the genre. With **Match reference** ticked and a reference track loaded, the reference becomes the target instead: Match EQ learns its tone, and its dynamics and stereo width set the goals. The report explains each choice, and the result is a single undo step.
 - **Trim & fades:** set in/out points at the playhead, with S-curve, exponential or linear fades.
 - **Album montage:** sequence tracks with pregaps, balance loudness, reorder / skip / remove tracks, play the whole album through the chain, and export one mastered WAV plus a CUE sheet. Tracks at other sample rates are resampled.
 - **Stem mixer:** split a track into 6 stems (or load stem files) and remix gain / pan / mute / solo.
-- **Export:** 16-bit, 24-bit or 32-bit float WAV with optional sinc resampling. Integer formats get dither (noise-shaped for 16-bit, TPDF for 24-bit). Latency is compensated and BWF metadata is written. Batch-processes whole folders.
+- **Export:** WAV (16-bit, 24-bit or 32-bit float, with BWF metadata), FLAC (16- or 24-bit), MP3 (320 / 192 kbps) and AAC in .m4a (192 / 128 kbps), with optional sinc resampling. Integer formats get dither (noise-shaped for 16-bit, TPDF for 24-bit and for lossy encoders). Latency is compensated. MP3 and AAC use the encoders built into Windows (Media Foundation), loaded at run time; on Windows N editions without the Media Feature Pack those formats report that they are unavailable. Lossy files are written at 44.1 or 48 kHz. The album export (with CUE sheet) and batch processing of whole folders use the same formats.
+- **QC report:** every export is decoded and checked. The report covers integrated loudness against the target, loudness range, maximum momentary and short-term loudness, 4× oversampled true peak and inter-sample overs, clipping (runs of full-scale samples), phase correlation (overall and worst 400 ms), mono fold-down loss, DC offset, and silence at each end. Each check is marked PASS, WARN or FAIL. The report opens in a window and is saved next to the file as `<name>.qc.txt`; a batch reports how many files QC flagged. Lossy files are measured as decoded, so overs added by the encoder show up.
+- **Codec preview (`P`):** with an MP3 or AAC export format selected, **Codec preview** renders the master, encodes and decodes it, and lines it up with the master (encoder delay is detected automatically). The transport then switches between **Master**, the **codec** version and the **Difference** (what the encoder throws away) at the same playhead position. The status line shows the codec's true peak against the master's and how far below the master the difference sits. If the chain changes afterwards, the preview is flagged as out of date.
 - **Presets:** `.xml` presets hold the chain order, every module's state and parameters, and any learned Match EQ curve. Factory presets in the element/param XML layout can also be imported.
 - **Drag and drop** audio files onto the window. Dropped files are added to the album in montage mode.
 - **MIDI control:** CC 1 drives the exciter, CC 7 maximizer drive, CC 10 stereo width, CC 64 play/pause and CC 80 the reference, plus notes 36 / 38 / 40 / 41 for play, stop, reference and bypass. Learned mappings override these.
@@ -97,6 +101,7 @@ Choose **Load VST3 plugin (fallback)...** in the processor list, or pick a plugi
 | `A` | Master Assistant |
 | `T` | Cycle loudness target |
 | `D` | Cycle export format |
+| `P` | Codec preview: build it, then cycle master / codec / difference |
 | `M` | Album montage |
 | `S` | Stem mixer |
 | `H` | Audio device info |
@@ -126,7 +131,7 @@ Pass an audio file path as the first argument to open it on launch. `--screensho
 cargo test -- --test-threads=1
 ```
 
-Highlights: golden-audio regression tests (`tests/golden/`; re-record after an intended change with `UPDATE_GOLDEN=1 cargo test --test golden_test`), aliasing and latency checks for oversampling, and flatness checks for the crossovers.
+Highlights: golden-audio regression tests (`tests/golden/`; re-record after an intended change with `UPDATE_GOLDEN=1 cargo test --test golden_test`), aliasing and latency checks for oversampling, flatness checks for the crossovers, a check that a shared spectral pass sounds like separate modules, FLAC / MP3 / AAC round trips, QC measurements against reference signals (EBU 1 kHz tone, inter-sample peaks, loudness range), and Assistant suggestions per genre and per reference. The MP3 / AAC tests skip themselves where Media Foundation is missing.
 
 The fallback-plugin tests only run when `MASTERING_STUDIO_TEST_VST3` points at a `.vst3` file (e.g. any installed third-party plugin); otherwise they skip. `engine_realtime_test` needs an audio output device, and `ml_separation_test` needs the model file.
 
@@ -136,7 +141,7 @@ The fallback-plugin tests only run when `MASTERING_STUDIO_TEST_VST3` points at a
 cargo run --release --example bench_modules
 ```
 
-This prints each module's CPU load at 48 kHz stereo. Every module runs far faster than real time; the default chain uses about 1.3% of one core, and all 19 modules together about 12%.
+This prints each module's CPU load at 48 kHz stereo. Every module runs far faster than real time; the default chain uses about 1.3% of one core, and all 19 modules together about 9% (neighbouring spectral modules share one FFT pass).
 
 ### Continuous integration
 

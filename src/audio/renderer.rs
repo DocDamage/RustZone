@@ -3,10 +3,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use super::buffer::AudioBuffer;
 use super::bwf::BwfMetadata;
+use super::encoder::{open_sink, EncoderSink, ExportCodec, MemorySink};
 use super::ml_separator::{StemBus, StemSet};
 use super::resample::SincResampler;
 use super::trim::TrimFadeSettings;
-use crate::dsp::{DitherType, MasteringDither, MasteringSuite};
+use crate::dsp::{DitherType, MasteringSuite};
 use crate::vst3::Vst3Plugin;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -79,73 +80,89 @@ impl RenderSource<'_> {
     }
 }
 
-fn write_samples<W: std::io::Write + std::io::Seek>(
-    writer: &mut hound::WavWriter<W>,
-    left: &[f32],
-    right: &[f32],
-    bit_depth: ExportBitDepth,
-    dither: &mut MasteringDither,
-) -> Result<(), String> {
-    for i in 0..left.len() {
-        let (l, r) = dither.process_sample(left[i], right[i]);
-        match bit_depth {
-            ExportBitDepth::Bit16 => {
-                writer.write_sample((l.clamp(-1.0, 1.0) * 32767.0).round() as i16).map_err(|e| e.to_string())?;
-                writer.write_sample((r.clamp(-1.0, 1.0) * 32767.0).round() as i16).map_err(|e| e.to_string())?;
-            }
-            ExportBitDepth::Bit24 => {
-                writer.write_sample((l.clamp(-1.0, 1.0) * 8388607.0).round() as i32).map_err(|e| e.to_string())?;
-                writer.write_sample((r.clamp(-1.0, 1.0) * 8388607.0).round() as i32).map_err(|e| e.to_string())?;
-            }
-            ExportBitDepth::Float32 => {
-                writer.write_sample(l).map_err(|e| e.to_string())?;
-                writer.write_sample(r).map_err(|e| e.to_string())?;
-            }
-        }
-    }
-    Ok(())
-}
-
+/// Render the master to a WAV file
 pub fn render_to_wav<P: AsRef<Path>>(
     input_buffer: &AudioBuffer,
     output_path: P,
     bit_depth: ExportBitDepth,
-    mut source: RenderSource,
+    source: RenderSource,
     options: Option<RenderOptions>,
     cancel_flag: Option<Arc<AtomicBool>>,
     progress_cb: impl Fn(f32),
 ) -> Result<(), String> {
-    let num_frames = input_buffer.num_frames();
-    if num_frames == 0 {
+    render_to_file(input_buffer, output_path, ExportCodec::Wav(bit_depth), source, options, cancel_flag, progress_cb)
+}
+
+/// Render the master and encode it in `codec` (WAV, FLAC, MP3 or AAC). Lossy codecs only take
+/// some sample rates, so the master may be resampled (`ExportCodec::output_rate`).
+pub fn render_to_file<P: AsRef<Path>>(
+    input_buffer: &AudioBuffer,
+    output_path: P,
+    codec: ExportCodec,
+    source: RenderSource,
+    options: Option<RenderOptions>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+    progress_cb: impl Fn(f32),
+) -> Result<(), String> {
+    if input_buffer.num_frames() == 0 {
         return Err("Input audio buffer is empty".to_string());
     }
+    let options = options.unwrap_or_default();
+    let target_sr = codec.output_rate(options.target_sample_rate.unwrap_or(input_buffer.sample_rate));
+    let dither = options.dither.unwrap_or_else(|| codec.default_dither());
+    let bwf = options.bwf_metadata.clone();
+    let mut sink = open_sink(output_path.as_ref(), codec, target_sr, dither, bwf)?;
+    render_into(input_buffer, target_sr, source, &options, cancel_flag, progress_cb, sink.as_mut())?;
+    sink.finish()
+}
 
+/// Render the master into memory, unquantized, at the input's rate unless the options ask for
+/// another
+pub fn render_to_buffer(
+    input_buffer: &AudioBuffer,
+    source: RenderSource,
+    options: Option<RenderOptions>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+    progress_cb: impl Fn(f32),
+) -> Result<AudioBuffer, String> {
+    if input_buffer.num_frames() == 0 {
+        return Err("Input audio buffer is empty".to_string());
+    }
+    let options = options.unwrap_or_default();
+    let target_sr = options.target_sample_rate.unwrap_or(input_buffer.sample_rate);
+    let mut sink = MemorySink::default();
+    render_into(input_buffer, target_sr, source, &options, cancel_flag, progress_cb, &mut sink)?;
+    Ok(AudioBuffer::from_stereo(sink.left, sink.right, target_sr))
+}
+
+/// Encode an already rendered master (dithered for integer and lossy formats)
+pub fn encode_buffer<P: AsRef<Path>>(buffer: &AudioBuffer, output_path: P, codec: ExportCodec, dither: Option<DitherType>) -> Result<(), String> {
+    let sr = codec.output_rate(buffer.sample_rate);
+    let (mut left, mut right) = buffer.to_stereo();
+    if sr != buffer.sample_rate {
+        (left, right) = SincResampler::default().resample_stereo(&left, &right, buffer.sample_rate, sr);
+    }
+    let mut sink = open_sink(output_path.as_ref(), codec, sr, dither.unwrap_or_else(|| codec.default_dither()), None)?;
+    for (l, r) in left.chunks(4096).zip(right.chunks(4096)) {
+        sink.write(l, r)?;
+    }
+    sink.finish()
+}
+
+/// Process `input_buffer` through `source` (trim, fades, latency compensation, resampling to
+/// `target_sr`) and stream the result into `sink`
+fn render_into(
+    input_buffer: &AudioBuffer,
+    target_sr: u32,
+    mut source: RenderSource,
+    options: &RenderOptions,
+    cancel_flag: Option<Arc<AtomicBool>>,
+    progress_cb: impl Fn(f32),
+    sink: &mut dyn EncoderSink,
+) -> Result<(), String> {
+    let num_frames = input_buffer.num_frames();
     let sample_rate = input_buffer.sample_rate;
-    let target_sr = options
-        .as_ref()
-        .and_then(|o| o.target_sample_rate)
-        .unwrap_or(sample_rate);
     let resampling = target_sr != sample_rate;
-
-    let spec = hound::WavSpec {
-        channels: 2,
-        sample_rate: target_sr,
-        bits_per_sample: bit_depth.bits_per_sample(),
-        sample_format: match bit_depth {
-            ExportBitDepth::Bit16 | ExportBitDepth::Bit24 => hound::SampleFormat::Int,
-            ExportBitDepth::Float32 => hound::SampleFormat::Float,
-        },
-    };
-
-    let dither_type = options
-        .as_ref()
-        .and_then(|o| o.dither)
-        .unwrap_or_else(|| bit_depth.default_dither());
-    let dither_bits = if bit_depth == ExportBitDepth::Bit16 { 16 } else { 24 };
-    let mut dither = MasteringDither::new(dither_type, dither_bits);
-
-    let mut writer = hound::WavWriter::create(&output_path, spec)
-        .map_err(|e| format!("Failed to create output WAV: {}", e))?;
 
     let block_size = 1024;
 
@@ -173,8 +190,8 @@ pub fn render_to_wav<P: AsRef<Path>>(
     match &mut source {
         RenderSource::Dsp(suite) => {
             let stems = options
-                .as_ref()
-                .and_then(|o| o.stems.clone())
+                .stems
+                .clone()
                 .filter(|s| s.num_frames == num_frames && s.sample_rate == sample_rate);
             suite.external_stems = stems.is_some() && suite.uses_stems();
             if suite.external_stems {
@@ -188,7 +205,7 @@ pub fn render_to_wav<P: AsRef<Path>>(
     }
 
     // Determine render frame boundaries (Top & Tail trim)
-    let trim_fade_opt = options.as_ref().and_then(|o| o.trim_fade);
+    let trim_fade_opt = options.trim_fade;
     let (start_frame, end_frame) = if let Some(ref tf) = trim_fade_opt {
         tf.get_frame_boundaries(num_frames)
     } else {
@@ -261,7 +278,7 @@ pub fn render_to_wav<P: AsRef<Path>>(
             processed_l.extend_from_slice(out_l);
             processed_r.extend_from_slice(out_r);
         } else {
-            write_samples(&mut writer, out_l, out_r, bit_depth, &mut dither)?;
+            sink.write(out_l, out_r)?;
         }
 
         out_frame += valid;
@@ -275,18 +292,9 @@ pub fn render_to_wav<P: AsRef<Path>>(
         let resampler = SincResampler::default();
         let (resampled_l, resampled_r) = resampler.resample_stereo(&processed_l, &processed_r, sample_rate, target_sr);
         progress_cb(0.85);
-        write_samples(&mut writer, &resampled_l, &resampled_r, bit_depth, &mut dither)?;
+        sink.write(&resampled_l, &resampled_r)?;
         progress_cb(1.0);
     }
-
-    writer.finalize().map_err(|e| format!("Failed to finalize WAV: {}", e))?;
-
-    // Inject Broadcast Wave Format (BWF bext chunk) metadata
-    let bwf_meta = options
-        .as_ref()
-        .and_then(|o| o.bwf_metadata.clone())
-        .unwrap_or_default();
-    let _ = bwf_meta.write_to_wav_file(&output_path);
 
     // Restore VST3 plugin sample rate and block size for real-time playback
     if let (Some((orig_sr, orig_bs)), RenderSource::Vst3(plugin)) = (vst3_restore_params, &mut source) {

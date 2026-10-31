@@ -238,3 +238,72 @@ fn test_full_chain_preset_roundtrip() {
         }
     }
 }
+
+/// Neighbouring spectral modules share one STFT: one FFT length of latency, and the same sound
+/// as running each module through its own STFT in turn
+#[test]
+fn test_neighbouring_spectral_modules_share_one_pass() {
+    let n = STFT_SIZE * 48;
+    let mut l = noise(n, 11, 0.3);
+    let mut r = noise(n, 12, 0.3);
+    let bass = sine(n, 70.0, 0.3);
+    let lead = sine(n, 3000.0, 0.15);
+    for i in 0..n {
+        l[i] += bass[i] + lead[i];
+        r[i] += bass[i] + 0.5 * lead[i];
+    }
+    let configure = |s: &mut MasteringSuite| {
+        s.stem_rebalance.set_enabled(true);
+        s.stem_rebalance.gains_db = [3.0, -4.0, 2.0, 0.0];
+        s.stem_eq.set_enabled(true);
+        s.stem_eq.set_param(5, 3.0); // Bass high
+        s.spectral_shaper.set_enabled(true);
+        s.spectral_shaper.set_param(2, 2.0);
+        s.stabilizer.set_enabled(true);
+        s.stabilizer.set_param(0, 0.8);
+        // The Stabilizer primes on its first non-silent frame, which differs when it sits behind
+        // its own STFT; a fast speed lets that start-up difference die away within the test
+        s.stabilizer.set_param(1, 200.0);
+    };
+
+    let mut suite = bare_suite();
+    configure(&mut suite);
+    // Only switched-off modules lie between them, so all four form one pass
+    assert_eq!(suite.latency_samples(), STFT_SIZE);
+    assert_eq!(suite.shared_spectral_modules(), 4);
+    let (mut sl, mut sr) = (l.clone(), r.clone());
+    for (cl, cr) in sl.chunks_mut(480).zip(sr.chunks_mut(480)) {
+        suite.process_stereo(cl, cr);
+    }
+
+    // The same modules, each through its own STFT, in chain order
+    let mut separate = bare_suite();
+    configure(&mut separate);
+    let (mut ol, mut or) = (l.clone(), r.clone());
+    for kind in [ModuleKind::StemRebalance, ModuleKind::StemEq, ModuleKind::SpectralShaper, ModuleKind::Stabilizer] {
+        for (cl, cr) in ol.chunks_mut(480).zip(or.chunks_mut(480)) {
+            separate.module_mut(kind).process(cl, cr);
+        }
+    }
+    let saved = 3 * STFT_SIZE; // separate processing has four times the latency
+    let (mut sig, mut err) = (0.0f64, 0.0f64);
+    for i in n / 2..n {
+        for (a, b) in [(sl[i - saved], ol[i]), (sr[i - saved], or[i])] {
+            sig += (b as f64).powi(2);
+            err += ((a - b) as f64).powi(2);
+        }
+    }
+    let snr = 10.0 * (sig / err.max(1e-30)).log10();
+    println!("shared vs separate spectral processing: SNR {:.1} dB", snr);
+    assert!(snr > 30.0, "shared pass sounds different from separate modules (SNR {:.1} dB)", snr);
+
+    // Auto gain-match measures a module's own input and output, so it takes the module out of the pass
+    suite.set_auto_gain(ModuleKind::StemEq, true);
+    assert_eq!(suite.latency_samples(), 3 * STFT_SIZE);
+    assert_eq!(suite.shared_spectral_modules(), 2);
+    // A time-domain module in between splits the pass in two
+    suite.set_auto_gain(ModuleKind::StemEq, false);
+    suite.imager.enabled = true;
+    assert_eq!(suite.latency_samples(), 2 * STFT_SIZE);
+    assert_eq!(suite.shared_spectral_modules(), 4);
+}

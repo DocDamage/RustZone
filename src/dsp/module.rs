@@ -124,6 +124,14 @@ pub trait Module {
     fn output_ceiling(&self) -> Option<f32> {
         None
     }
+    /// STFT-domain modules expose their frame processing so the suite can run neighbours in one
+    /// shared spectral pass
+    fn spectral(&mut self) -> Option<&mut dyn super::stft::SpectralProcess> {
+        None
+    }
+    fn is_spectral(&self) -> bool {
+        false
+    }
 }
 
 macro_rules! module_kinds {

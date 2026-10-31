@@ -2,7 +2,7 @@
 
 use eframe::egui::{self, RichText};
 
-use super::app::{with_render_source, MasteringApp};
+use super::app::{check_export, with_render_source, MasteringApp};
 use super::widgets::{DIM, GOOD, HOT};
 use super::{AUDIO_EXTENSIONS, EXPORT_FORMATS};
 
@@ -115,27 +115,37 @@ pub fn show(app: &mut MasteringApp, ui: &mut egui::Ui) {
 
 fn export_album(app: &mut MasteringApp) {
     let format = EXPORT_FORMATS[app.export_format];
+    let (filter, ext) = format.filter();
     let Some(path) = rfd::FileDialog::new()
         .set_title(format!("Export album ({})", format.name))
-        .set_file_name("album_master.wav")
-        .add_filter("WAV", &["wav"])
+        .set_file_name(format!("album_master.{}", ext))
+        .add_filter(filter, &[ext])
         .save_file()
     else {
         return;
     };
+    let path = format.codec.with_extension(&path);
     app.engine.pause();
     let montage = app.engine.with_montage(|m| m.clone());
     let mode = app.engine.processing_mode();
     let ctx = app.ctx.clone();
+    let targets = app.qc_targets();
+    let qc_out = std::sync::Arc::clone(&app.qc_report);
     app.spawn_job(move |engine, status| {
         let res = with_render_source(engine, mode, |source| {
-            montage.export_album_with_source(&path, format.bit_depth, format.sample_rate, source, |p, msg| {
+            montage.export_album_with_source(&path, format.codec, format.sample_rate, source, |p, msg| {
                 status.set(format!("Album {:.0}%: {}", p * 100.0, msg));
                 ctx.request_repaint();
             })
         });
         match res {
-            Ok(cue) => status.set(format!("Album exported with CUE sheet {}", cue.display())),
+            Ok(cue) => match check_export(&path, format.name, targets) {
+                Ok(report) => {
+                    status.set(format!("Album exported with CUE sheet {}: {}", cue.display(), report.summary()));
+                    *qc_out.lock() = Some(report.to_text());
+                }
+                Err(e) => status.set(format!("Album exported with CUE sheet {} ({})", cue.display(), e)),
+            },
             Err(e) => status.set(format!("Album export failed: {}", e)),
         }
     });
